@@ -1,314 +1,566 @@
 #!/usr/bin/env python3
 """
-goldbach.py
+Goldbach sampler with dual strategies racing each other.
 
-Goldbach decomposition sampler using two persistent worker processes.
+Requirements:
+    pip install gmpy2
 
-For each even n >= 6, we search for primes p, q such that n = p + q
-with n = p + q and p, q prime.
+Example usage:
+    python3 gold_race.py --sweep 14:20 --count 1000 --seed 1
 
-We use subtractor primes p indexed as:
-    index 0 -> 3
-    index 1 -> 5
-    index 2 -> 7
-    index 3 -> 11
-    ...
+Behavior:
+    - For each digit length D in the sweep, sample `count` random even n
+      uniformly from [10^(D-1), 10^D - 1], restricted to even numbers >= 4.
 
-Two cores, two phases per n:
+    - For each n, run a "race" between two strategies:
 
-Phase 1:
-    - Let max_idx = max_subs_so_far - 1 (or 0 if no history).
-    - Let mid = max_idx // 2.
-    - Core 1 tests indices 0 .. mid (ascending).
-    - Core 2 tests indices max_idx .. mid+1 (descending).
-    They "work towards each other" over [0, max_idx].
+      Strategy 1 (Strat1): small subtractor primes with mean-based zig-zag
+        * Maintain a global mean subtractor count mean_sub.
+        * Let P[i] be the i-th odd prime (P[0] = 3, P[1] = 5, ...).
+        * mean_index = ceil(mean_sub) - 1 (clamped to >= 0).
+        * Try indices in order:
+              0, mean_index, 1, mean_index - 1, 2, mean_index - 2, ...
+          (interleaving very small primes and around the mean index).
+        * After exhausting [0 .. mean_index], continue with indices
+          mean_index+1, mean_index+2, ... while P[i] < n.
 
-Phase 2 (if Phase 1 finds no decomposition):
-    - Core 1 tests indices max_idx+1, max_idx+3, max_idx+5, ...
-    - Core 2 tests indices max_idx+2, max_idx+4, max_idx+6, ...
-    They "expand max" together until a decomposition is found.
+      Strategy 2 (Strat2): subtractor primes near n/2 with mean-distance zig-zag
+        * Let mid = n/2.
+        * Start from the first odd >= mid.
+        * Maintain a global mean "step distance" mean_mid_steps.
+          A "step" is +2 from the starting odd:
+              step k --> p = start + 2*k
+        * mean_k = ceil(mean_mid_steps).
+        * Try k in order:
+              0, mean_k, 1, mean_k - 1, 2, mean_k - 2, ...
+          (interleaving center and around average distance).
+        * After exhausting [0 .. mean_k], continue with k = mean_k+1, mean_k+2, ...
+          while p < n.
 
-Only per-digit stats are printed:
+      Race logic:
+        * Alternate between Strat1 and Strat2:
+            - Take one candidate from Strat1, test it.
+            - Take one candidate from Strat2, test it.
+            - Repeat until one strategy finds a decomposition n = p + q
+              with both p and q prime, or both strategies run out.
+        * Maintain a set of tested p so we never test the same subtractor twice
+          even if both strategies propose it.
+        * The "subtractor count" for this n is the TOTAL number of tested p
+          across both strategies before success.
 
-    Digit length: D | Median Sub Count: X | Max Sub Count: Y |
-    Avg. ms per n: Z | Digit total ms: W
+    - Statistics:
+        * For each digit length D:
+            - Max Sub: maximum total subtractor count over successful n.
+            - Avg. Sub: ceil(average total subtractor count over successful n).
+            - Skip: number of n that ended with no decomposition found
+              (should be 0 in all practical ranges).
+            - A histogram of total subtractor counts, with dynamic bins.
+            - Strat1 wins vs Strat2 wins (how many times each strategy
+              found the decomposition first).
+
+        * Global stats:
+            - Global mean subtractor count mean_sub (used by Strat1).
+            - Global mean mid-distance in "steps" for Strat2:
+                  step distance = |p - n/2| / 2
+            - Total Strat1 wins vs total Strat2 wins.
+
+    - Output per digit length (main line):
+        D: __ | Ms: __ | Ms per n: __ | Max Sub: __ | Avg. Sub: __ | Skip: __
+
+      Followed by:
+        Strat1 wins / Strat2 wins and a histogram.
 """
 
 import argparse
+import math
 import random
-import sys
 import time
-from statistics import median
-import multiprocessing as mp
 
-try:
-    import gmpy2
-except ImportError:
-    sys.stderr.write("Install gmpy2 with: pip install gmpy2\n")
-    sys.exit(1)
+import gmpy2
+from gmpy2 import mpz, is_prime, next_prime
 
 
-# ---------------------------------------------------------------
-# Sweep & sampling helpers
-# ---------------------------------------------------------------
+# ---------- Global list of small subtractor primes for Strategy 1 ----------
 
-def parse_sweep(sweep_str):
-    try:
-        start_str, end_str, step_str = sweep_str.split(":")
-        start = int(start_str)
-        end = int(end_str)
-        step = int(step_str)
-    except Exception:
-        raise ValueError("Sweep must be start:end:step  (example: 100:120:1)")
-
-    if start <= 0 or end <= 0 or step <= 0:
-        raise ValueError("start, end, and step must be positive integers")
-    if start > end:
-        raise ValueError("sweep start must be <= end")
-
-    return list(range(start, end + 1, step))
+SMALL_PRIMES = [mpz(3)]  # P[0] = 3, then 5, 7, 11, ...
 
 
-def sample_even_numbers_of_digit_length(d, count, rng):
+def ensure_prime_index(idx: int) -> mpz:
     """
-    Sample 'count' even integers n with exactly d decimal digits, n >= 6.
-    Uniform among evens in the range.
+    Ensure SMALL_PRIMES has a prime at position idx and return it.
     """
-    start = 10 ** (d - 1)
-    end = 10 ** d - 1
-    start = max(start, 6)
-
-    if start % 2 != 0:
-        start += 1
-    if end % 2 != 0:
-        end -= 1
-
-    if start > end:
-        return []
-
-    num_evens = (end - start) // 2 + 1
-    return [start + 2 * rng.randint(0, num_evens - 1) for _ in range(count)]
+    global SMALL_PRIMES
+    while len(SMALL_PRIMES) <= idx:
+        last = SMALL_PRIMES[-1]
+        SMALL_PRIMES.append(next_prime(last))
+    return SMALL_PRIMES[idx]
 
 
-# ---------------------------------------------------------------
-# Global dynamic stats (master process only)
-# ---------------------------------------------------------------
+# ---------- Strategy 1: small subtractor primes with mean-based zig-zag ----------
 
-class DynamicStats:
-    def __init__(self):
-        self._subs = []
-
-    def update(self, subs_count: int):
-        self._subs.append(subs_count)
-
-    @property
-    def has_data(self):
-        return len(self._subs) > 0
-
-    @property
-    def max_subs(self):
-        return max(self._subs) if self._subs else 0
-
-    @property
-    def median_subs(self):
-        return median(self._subs) if self._subs else 0.0
-
-
-# ---------------------------------------------------------------
-# Worker process logic
-# ---------------------------------------------------------------
-
-def worker_loop(worker_id, task_queue, result_queue, winner_event, winner_subs_count, winner_lock):
+class Strat1State:
     """
-    Persistent worker loop.
+    Strategy 1 state:
 
-    Receives tasks of the form:
-
-        ("phase1", n, start_idx, end_idx, step)
-        ("phase2", n, start_idx, step)
-
-    For each n, the worker maintains a running count of how many subtractor
-    primes it has tested for that n. When a worker finds a valid decomposition,
-    it tries to claim victory by setting winner_subs_count and winner_event.
-
-    Prime generation is done by index, with a small cached list of subtractor
-    primes: [3, 5, 7, 11, ...]. This is tiny (thousands of primes at most).
+    Uses a global list of odd primes P[i] starting from 3.
+    For a given n and mean_sub, constructs an index pattern:
+        0, mean_index, 1, mean_index-1, 2, mean_index-2, ...
+    then tail: mean_index+1, mean_index+2, ...
+    stopping when P[i] >= n.
     """
-    # Local prime cache by index: index 0 -> 3, 1 -> 5, 2 -> 7, ...
-    sub_primes = [gmpy2.mpz(3)]
-    tests_per_n = {}  # n (int) -> number of tests this worker has done for that n
 
-    def ensure_prime_index(idx):
-        """Ensure sub_primes[idx] exists."""
-        while len(sub_primes) <= idx:
-            sub_primes.append(gmpy2.next_prime(sub_primes[-1]))
-
-    while True:
-        task = task_queue.get()
-        if task is None:
-            # Sentinel: shut down worker
-            break
-
-        mode = task[0]
-
-        if mode == "phase1":
-            _, n, start_idx, end_idx, step = task
-            n_int = int(n)
-            n_mpz = gmpy2.mpz(n)
-            tests = tests_per_n.get(n_int, 0)
-
-            if step > 0:
-                cond = lambda i: i <= end_idx
-            else:
-                cond = lambda i: i >= end_idx
-
-            i = start_idx
-            while cond(i) and not winner_event.is_set():
-                ensure_prime_index(i)
-                p = sub_primes[i]
-                q = n_mpz - p
-                if q < 2:
-                    break
-
-                tests += 1
-                if gmpy2.is_prime(q):
-                    with winner_lock:
-                        if not winner_event.is_set():
-                            winner_subs_count.value = tests
-                            winner_event.set()
-                    break
-
-                i += step
-
-            tests_per_n[n_int] = tests
-            result_queue.put(1)
-
-        elif mode == "phase2":
-            _, n, start_idx, step = task
-            n_int = int(n)
-            n_mpz = gmpy2.mpz(n)
-            tests = tests_per_n.get(n_int, 0)
-
-            i = start_idx
-            while not winner_event.is_set():
-                ensure_prime_index(i)
-                p = sub_primes[i]
-                q = n_mpz - p
-                if q < 2:
-                    break
-
-                tests += 1
-                if gmpy2.is_prime(q):
-                    with winner_lock:
-                        if not winner_event.is_set():
-                            winner_subs_count.value = tests
-                            winner_event.set()
-                    break
-
-                i += step
-
-            tests_per_n[n_int] = tests
-            result_queue.put(1)
-
+    def __init__(self, mean_sub: float | None, n: mpz):
+        if mean_sub is None or mean_sub <= 1:
+            self.mean_index = 0
         else:
-            # Unknown mode; ignore
-            result_queue.put(1)
+            mi = int(math.ceil(mean_sub)) - 1
+            self.mean_index = mi if mi >= 0 else 0
+
+        # Make sure the prime list is extended up to mean_index
+        ensure_prime_index(self.mean_index)
+
+        self.low = 0
+        self.high = self.mean_index
+        self.phase = "zigzag"   # "zigzag" or "tail"
+        self.tail_idx = self.mean_index + 1
+        self.n = n
+        self.done = False
+        self.step = 0
+
+    def next_candidate(self) -> mpz | None:
+        """
+        Return the next subtractor prime p for this strategy, or None if done.
+        """
+        if self.done:
+            return None
+
+        n = self.n
+
+        while True:
+            if self.phase == "zigzag":
+                if self.low > self.high:
+                    # Finished interleaving [0 .. mean_index], move to tail
+                    self.phase = "tail"
+                    continue
+
+                if self.step % 2 == 0:
+                    idx = self.low
+                    self.low += 1
+                else:
+                    idx = self.high
+                    self.high -= 1
+
+                self.step += 1
+
+                if idx < 0:
+                    continue
+
+                p = ensure_prime_index(idx)
+                if p >= n:
+                    # Primes at or above n are useless for n - p = q
+                    # Continue in case there are still smaller indices
+                    if self.low > self.high:
+                        self.phase = "tail"
+                    continue
+
+                return p
+
+            else:  # tail phase
+                idx = self.tail_idx
+                self.tail_idx += 1
+
+                p = ensure_prime_index(idx)
+                if p >= n:
+                    # No more possible primes for this strategy
+                    self.done = True
+                    return None
+
+                return p
 
 
-# ---------------------------------------------------------------
-# Per-n coordination using the persistent workers
-# ---------------------------------------------------------------
+# ---------- Strategy 2: around n/2 with mean-distance zig-zag ----------
 
-def goldbach_parallel_for_n(n, stats, ctx):
+class Strat2State:
     """
-    Coordinate the two persistent workers to process a single n, using:
+    Strategy 2 state:
 
-      Phase 1:
-        Core 1: indices [0 .. mid] ascending
-        Core 2: indices [max_idx .. mid+1] descending
+    Let mid = n // 2. Start from the first odd >= mid ("center" p0).
+    Define steps k >= 0:
+        step k → p = start + 2*k
 
-      Phase 2 (if needed):
-        Core 1: max_idx+1, max_idx+3, max_idx+5, ...
-        Core 2: max_idx+2, max_idx+4, max_idx+6, ...
+    With a global mean_mid_steps, we define mean_k = ceil(mean_mid_steps).
+    Then we use the pattern:
+        k = 0, mean_k, 1, mean_k-1, 2, mean_k-2, ...
+    and then tail: mean_k+1, mean_k+2, ...
+    Any candidate p >= n is invalid (q <= 0).
+    """
+
+    def __init__(self, mean_steps: float | None, n: mpz):
+        self.n = n
+        mid = n // 2
+        self.mid = mid
+
+        # First odd >= mid
+        self.start = mid if mid % 2 == 1 else mid + 1
+        if self.start >= n:
+            self.done = True
+        else:
+            self.done = False
+
+        if mean_steps is None or mean_steps <= 0:
+            self.mean_k = 0
+        else:
+            mk = int(math.ceil(mean_steps))
+            self.mean_k = mk if mk >= 0 else 0
+
+        self.low = 0
+        self.high = self.mean_k
+        self.phase = "zigzag"  # "zigzag" or "tail"
+        self.tail_k = self.mean_k + 1
+        self.step = 0
+
+    def next_candidate(self) -> mpz | None:
+        """
+        Return the next subtractor prime candidate p (odd integer),
+        or None if done.
+        """
+        if self.done:
+            return None
+
+        n = self.n
+
+        while True:
+            if self.phase == "zigzag":
+                if self.low > self.high:
+                    # Finished interleaving [0 .. mean_k], move to tail
+                    self.phase = "tail"
+                    continue
+
+                if self.step % 2 == 0:
+                    k = self.low
+                    self.low += 1
+                else:
+                    k = self.high
+                    self.high -= 1
+
+                self.step += 1
+
+                if k < 0:
+                    continue
+
+                p = self.start + 2 * k
+                if p >= n:
+                    # Reached/passed n; future steps will only be larger
+                    if self.low > self.high:
+                        self.phase = "tail"
+                    else:
+                        # Even if there are k left, they only increase p further
+                        self.done = True
+                        return None
+                    continue
+
+                return p
+
+            else:  # tail phase
+                k = self.tail_k
+                self.tail_k += 1
+
+                p = self.start + 2 * k
+                if p >= n:
+                    self.done = True
+                    return None
+
+                return p
+
+
+# ---------- Combined race between the two strategies ----------
+
+def goldbach_race(
+    n: int,
+    mean_sub: float | None,
+    mean_mid_steps: float | None,
+) -> tuple[bool, int, int, int, int, int | None]:
+    """
+    Run a race between Strat1 and Strat2 for even n >= 4.
 
     Returns:
-        subs_count (int): number of subtractor primes tested by the winning core,
-                          or 0 if, unexpectedly, no decomposition is found.
+        (found, total_checks, winner, s1_count, s2_count, mid_steps_result)
+
+        * found: True if a decomposition was found.
+        * total_checks: total number of subtractor candidates tested
+          across BOTH strategies before success (the "subtractor count").
+        * winner: 0 if none; 1 if Strat1 won; 2 if Strat2 won.
+        * s1_count: how many candidates Strat1 tested.
+        * s2_count: how many candidates Strat2 tested.
+        * mid_steps_result: if winner == 2, the distance in "steps" from n/2
+          to the winning p (i.e., |p - n/2| / 2); otherwise None.
     """
-    task_queue = ctx["task_queue"]
-    result_queue = ctx["result_queue"]
-    winner_event = ctx["winner_event"]
-    winner_subs_count = ctx["winner_subs_count"]
+    n = mpz(n)
 
-    # Reset winner state for this n
-    winner_event.clear()
-    winner_subs_count.value = 0
+    if n < 4 or n % 2 != 0:
+        return False, 0, 0, 0, 0, None
 
-    # Determine current frontier
-    if stats.has_data:
-        max_idx = max(0, int(stats.max_subs) - 1)
-    else:
-        max_idx = 0
+    strat1 = Strat1State(mean_sub, n)
+    strat2 = Strat2State(mean_mid_steps, n)
 
-    # -------------------- Phase 1 --------------------
-    mid = max_idx // 2
+    visited: set[int] = set()
+    total = 0
+    s1_count = 0
+    s2_count = 0
 
-    # Core 1: indices 0 .. mid (ascending)
-    phase1_task_core1 = ("phase1", n, 0, mid, +1)
+    winner = 0
+    mid_steps_result: int | None = None
 
-    # Core 2: indices max_idx .. mid+1 (descending), but only if max_idx >= 1
-    if max_idx >= 1:
-        phase1_task_core2 = ("phase1", n, max_idx, mid + 1, -1)
-    else:
-        # Degenerate: nothing to do in Phase 1 for core2
-        phase1_task_core2 = ("phase1", n, 0, -1, -1)  # empty range
+    # Alternate between strategies until one finds a decomposition
+    while True:
+        progressed = False
 
-    task_queue.put(phase1_task_core1)
-    task_queue.put(phase1_task_core2)
+        # Step from Strategy 1
+        if not strat1.done:
+            p = strat1.next_candidate()
+            if p is not None:
+                progressed = True
+                ip = int(p)
+                if ip not in visited:
+                    visited.add(ip)
+                    q = n - p
+                    total += 1
+                    s1_count += 1
+                    if is_prime(q):
+                        winner = 1
+                        break
 
-    # Wait for both workers to finish Phase 1
-    result_queue.get()
-    result_queue.get()
+        # Step from Strategy 2
+        if not strat2.done and winner == 0:
+            p2 = strat2.next_candidate()
+            if p2 is not None:
+                progressed = True
+                ip2 = int(p2)
+                if ip2 not in visited:
+                    visited.add(ip2)
+                    q2 = n - p2
+                    total += 1
+                    s2_count += 1
+                    if is_prime(q2):
+                        winner = 2
+                        # Distance from n/2 in "steps" of 2
+                        mid = n // 2
+                        dist = abs(p2 - mid)
+                        mid_steps_result = int(dist // 2)
+                        break
 
-    if winner_event.is_set():
-        return int(winner_subs_count.value)
+        if winner != 0:
+            break
 
-    # -------------------- Phase 2 (expand beyond max) --------------------
-    # Core 1: odd offsets above max_idx
-    # Core 2: even offsets above max_idx
-    start1 = max_idx + 1
-    start2 = max_idx + 2
+        if not progressed:
+            # Both strategies are out of candidates
+            break
 
-    phase2_task_core1 = ("phase2", n, start1, +2)
-    phase2_task_core2 = ("phase2", n, start2, +2)
+    if winner == 0:
+        return False, total, 0, s1_count, s2_count, None
 
-    task_queue.put(phase2_task_core1)
-    task_queue.put(phase2_task_core2)
-
-    result_queue.get()
-    result_queue.get()
-
-    return int(winner_subs_count.value)
+    return True, total, winner, s1_count, s2_count, mid_steps_result
 
 
-# ---------------------------------------------------------------
-# Main driver
-# ---------------------------------------------------------------
+# ---------- Random even generator for a given digit length ----------
 
-def main():
+def random_even_with_digits(rng: random.Random, digits: int) -> int:
+    """
+    Draw a random even integer with exactly `digits` decimal digits,
+    ensuring n >= 4.
+    """
+    if digits <= 0:
+        raise ValueError("Digit length must be positive.")
+
+    low = 10 ** (digits - 1)
+    high = 10 ** digits - 1
+
+    # First even in [low, high]
+    first_even = low if low % 2 == 0 else low + 1
+    # Last even in [low, high]
+    last_even = high if high % 2 == 0 else high - 1
+
+    if last_even < first_even:
+        raise ValueError(f"No usable even numbers in digit range {digits}.")
+
+    count_evens = ((last_even - first_even) // 2) + 1
+    k = rng.randrange(count_evens)
+    n = first_even + 2 * k
+
+    if n < 4:
+        n += 2 * ((4 - n + 1) // 2)
+        if n > last_even:
+            n = first_even
+
+    return n
+
+
+# ---------- Dynamic histogram of subtractor counts ----------
+
+def build_histogram(counts: list[int]) -> list[tuple[int, int, int]]:
+    """
+    Build a dynamic histogram of subtractor counts.
+
+    Returns:
+        List of (start, end, frequency) bins.
+    """
+    if not counts:
+        return []
+
+    max_c = max(counts)
+    if max_c <= 0:
+        return []
+
+    bins = 10  # number of bins
+    width = max(1, math.ceil(max_c / bins))
+
+    hist: list[tuple[int, int, int]] = []
+    for i in range(bins):
+        start = i * width + 1
+        end = (i + 1) * width
+        if start > max_c:
+            break
+        freq = sum(1 for c in counts if start <= c <= end)
+        hist.append((start, end, freq))
+
+    return hist
+
+
+# ---------- Main sweep logic ----------
+
+def run_sweep(start_digits: int, end_digits: int, count_per_digit: int, seed: int | None) -> None:
+    """
+    Run the Goldbach sampler across digit lengths [start_digits, end_digits].
+    """
+    if start_digits > end_digits:
+        start_digits, end_digits = end_digits, start_digits
+
+    rng = random.Random(seed)
+
+    # Global mean subtractor count (for Strat1)
+    global_mean_sub: float | None = None
+    global_sub_sum = 0
+    global_sub_count = 0
+
+    # Global mean mid-distance steps (for Strat2)
+    global_mean_mid_steps: float | None = None
+    global_mid_steps_sum = 0
+    global_mid_steps_count = 0
+
+    # Global strategy win counts
+    global_s1_wins = 0
+    global_s2_wins = 0
+
+    for D in range(start_digits, end_digits + 1):
+        digit_sub_sum = 0
+        digit_sub_count = 0
+        digit_max_sub = 0
+        digit_skip = 0
+        digit_counts: list[int] = []
+
+        digit_s1_wins = 0
+        digit_s2_wins = 0
+
+        start_time = time.perf_counter()
+
+        for _ in range(count_per_digit):
+            try:
+                n = random_even_with_digits(rng, D)
+            except ValueError:
+                # No valid evens for this digit length
+                digit_skip = count_per_digit
+                break
+
+            found, total_checks, winner, s1_count, s2_count, mid_steps = goldbach_race(
+                n, global_mean_sub, global_mean_mid_steps
+            )
+
+            if found:
+                # Use total_checks (across both strategies) as the subtractor count
+                digit_sub_sum += total_checks
+                digit_sub_count += 1
+                digit_counts.append(total_checks)
+                if total_checks > digit_max_sub:
+                    digit_max_sub = total_checks
+
+                # Update global mean subtractor count
+                global_sub_sum += total_checks
+                global_sub_count += 1
+                global_mean_sub = global_sub_sum / global_sub_count
+
+                # Update global mean mid-distance for Strat2 when it wins
+                if winner == 2 and mid_steps is not None:
+                    global_mid_steps_sum += mid_steps
+                    global_mid_steps_count += 1
+                    global_mean_mid_steps = global_mid_steps_sum / global_mid_steps_count
+
+                # Strategy win bookkeeping
+                if winner == 1:
+                    digit_s1_wins += 1
+                    global_s1_wins += 1
+                elif winner == 2:
+                    digit_s2_wins += 1
+                    global_s2_wins += 1
+
+            else:
+                # No decomposition found (should be rare)
+                digit_skip += 1
+
+        end_time = time.perf_counter()
+        elapsed_ms = (end_time - start_time) * 1000.0
+        ms_per_n = elapsed_ms / count_per_digit if count_per_digit > 0 else 0.0
+
+        if digit_sub_count > 0:
+            avg_sub = math.ceil(digit_sub_sum / digit_sub_count)
+        else:
+            avg_sub = 0
+
+        # Main summary line (kept in your requested format)
+        print(
+            f"D: {D} | "
+            f"Ms: {elapsed_ms:.3f} | "
+            f"Ms per n: {ms_per_n:.6f} | "
+            f"Max Sub: {digit_max_sub} | "
+            f"Avg. Sub: {avg_sub} | "
+            f"Skip: {digit_skip}"
+        )
+
+        # Per-digit strategy wins
+        print(f"  Strat1 wins: {digit_s1_wins} | Strat2 wins: {digit_s2_wins}")
+
+        # Histogram for this digit length
+        hist = build_histogram(digit_counts)
+        if hist:
+            print("  Histogram (Subtractor count → frequency):")
+            for start, end, freq in hist:
+                if freq > 0:
+                    print(f"    [{start:3d}-{end:3d}]: {freq}")
+        else:
+            print("  Histogram: (no data)")
+
+    # Global summary
+    print(f"Total Strat1 wins: {global_s1_wins} | Total Strat2 wins: {global_s2_wins}")
+    if global_mid_steps_count > 0:
+        print(f"Global mean mid-distance steps (Strat2): {global_mean_mid_steps:.3f}")
+
+
+# ---------- Argument parsing / entry point ----------
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Goldbach decomposition sweeper with two persistent workers and two-phase search."
+        description="Goldbach sampler with racing strategies and dynamic histograms."
     )
     parser.add_argument(
         "--sweep",
+        type=str,
         required=True,
-        help="Digit-length sweep in format start:end:step (e.g., 100:120:1).",
+        help="Digit range in the form START:END (e.g., 4:10).",
     )
     parser.add_argument(
         "--count",
         type=int,
-        default=50,
-        help="Number of sampled n values per digit length (default: 50).",
+        default=1000,
+        help="Number of random even n per digit length (default: 1000).",
     )
     parser.add_argument(
         "--seed",
@@ -316,91 +568,25 @@ def main():
         default=None,
         help="Random seed for reproducibility (default: None).",
     )
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    try:
-        digit_lengths = parse_sweep(args.sweep)
-    except ValueError as e:
-        sys.stderr.write(f"Error parsing --sweep: {e}\n")
-        sys.exit(1)
-
-    rng = random.Random(args.seed)
-    stats = DynamicStats()
-
-    # Shared IPC primitives & worker context
-    task_queue = mp.Queue()
-    result_queue = mp.Queue()
-    winner_event = mp.Event()
-    winner_subs_count = mp.Value("i", 0)
-    winner_lock = mp.Lock()
-
-    ctx = {
-        "task_queue": task_queue,
-        "result_queue": result_queue,
-        "winner_event": winner_event,
-        "winner_subs_count": winner_subs_count,
-        "winner_lock": winner_lock,
-    }
-
-    # Start two persistent worker processes
-    workers = []
-    for wid in range(2):
-        p = mp.Process(
-            target=worker_loop,
-            args=(wid, task_queue, result_queue, winner_event, winner_subs_count, winner_lock),
-        )
-        p.start()
-        workers.append(p)
-
-    print(f"Sweep digit lengths: {digit_lengths}")
-    print(f"Samples per digit length: {args.count}")
-    print(f"Random seed: {args.seed}")
-    print("")
+def main() -> None:
+    args = parse_args()
 
     try:
-        for d in digit_lengths:
-            ns = sample_even_numbers_of_digit_length(d, args.count, rng)
-            if not ns:
-                print(f"Digit length: {d} | No valid n values.\n")
-                continue
+        start_str, end_str = args.sweep.split(":")
+        start_digits = int(start_str)
+        end_digits = int(end_str)
+    except Exception as e:
+        raise SystemExit(f"Invalid --sweep format. Expected A:B, got '{args.sweep}'.") from e
 
-            ns.sort()
-
-            digit_start = time.perf_counter()
-            n_times = []
-
-            for n in ns:
-                t0 = time.perf_counter()
-                subs = goldbach_parallel_for_n(n, stats, ctx)
-                t1 = time.perf_counter()
-
-                n_times.append(t1 - t0)
-
-                if subs > 0:
-                    stats.update(subs)
-                # If subs == 0, no decomposition found (should not happen).
-
-            digit_end = time.perf_counter()
-
-            avg_ms = (sum(n_times) / len(n_times) * 1000.0) if n_times else 0.0
-            total_ms = (digit_end - digit_start) * 1000.0
-
-            print(
-                f"Digit length: {d} | "
-                f"Median Sub Count: {stats.median_subs:.3f} | "
-                f"Max Sub Count: {stats.max_subs} | "
-                f"Avg. ms per n: {avg_ms:.3f} | "
-                f"Digit total ms: {total_ms:.3f}"
-            )
-            print("")
-
-    finally:
-        # Cleanly shut down workers
-        for _ in workers:
-            task_queue.put(None)   # Sentinel for each worker
-        for p in workers:
-            p.join()
+    run_sweep(
+        start_digits=start_digits,
+        end_digits=end_digits,
+        count_per_digit=args.count,
+        seed=args.seed,
+    )
 
 
 if __name__ == "__main__":
