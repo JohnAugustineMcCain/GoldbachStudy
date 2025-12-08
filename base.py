@@ -2,9 +2,20 @@
 """
 goldbach.py
 
-Experimentally probes Goldbach decompositions by sampling even n in digit-length
-ranges and searching for prime decompositions n = p + q using "subtractor primes"
-p tested in increasing order (3, 5, 7, 11, ...).
+Parallel Goldbach decomposition sampler using two CPU cores.
+
+For each even n >= 6, we look for primes p, q such that n = p + q, using
+subtractor primes p generated on the fly with gmpy2.next_prime.
+
+We run two workers in parallel:
+
+  Core 1: starts from p = 3 and increases (3, 5, 7, 11, ...)
+  Core 2: starts from the prime at index ~median_subs_so_far and increases.
+
+We record:
+  - subs_count: number of subtractor primes tested by the *winning* core.
+  - Dynamic global stats: median_subs, max_subs across all n so far.
+  - Timing per digit length (total ms and avg ms per n).
 
 Example:
     python3 goldbach.py --sweep 4:10:2 --count 50 --seed 1
@@ -12,10 +23,10 @@ Example:
 
 import argparse
 import random
-import math
 import sys
-from collections import defaultdict
+import time
 from statistics import median
+import multiprocessing as mp
 
 try:
     import gmpy2
@@ -26,6 +37,10 @@ except ImportError:
     )
     sys.exit(1)
 
+
+# ----------------------------------------------------------------------
+# Utility: sweep, sampling, stats
+# ----------------------------------------------------------------------
 
 def parse_sweep(sweep_str):
     """
@@ -45,120 +60,172 @@ def parse_sweep(sweep_str):
     if start > end:
         raise ValueError("sweep start must be <= end")
 
-    digit_lengths = list(range(start, end + 1, step))
-    return digit_lengths
-
-
-class SubtractorPrimeGenerator:
-    """
-    Maintains a growing list of subtractor primes p (3, 5, 7, 11, ...)
-    using gmpy2.next_prime(). The list is extended as needed up to some
-    maximum p requested.
-    """
-
-    def __init__(self):
-        self.sub_primes = []
-        self._init_first_prime()
-
-    def _init_first_prime(self):
-        # First subtractor prime is 3
-        self.sub_primes.append(gmpy2.mpz(3))
-
-    def ensure_up_to(self, max_p):
-        """
-        Ensure that all subtractor primes up to max_p are generated.
-        """
-        max_p = gmpy2.mpz(max_p)
-        while self.sub_primes[-1] < max_p:
-            next_p = gmpy2.next_prime(self.sub_primes[-1])
-            self.sub_primes.append(next_p)
-
-    def iter_subtractors(self, upper_bound):
-        """
-        Yield subtractor primes p in increasing order, up to upper_bound (inclusive).
-        """
-        if upper_bound < 3:
-            return
-        self.ensure_up_to(upper_bound)
-        for p in self.sub_primes:
-            if p > upper_bound:
-                break
-            yield p
+    return list(range(start, end + 1, step))
 
 
 def sample_even_numbers_of_digit_length(d, count, rng):
     """
-    Sample 'count' distinct (or not necessarily distinct) even integers n
-    with exactly d decimal digits, n >= 6.
-
-    We sample uniformly among the even numbers in the digit-length range.
+    Sample 'count' even integers n with exactly d decimal digits, n >= 6.
+    Uniform among evens in the range.
     """
-    # Range of numbers with d digits
     start = 10 ** (d - 1)
     end = 10 ** d - 1
 
-    # Ensure start is at least 6
     start = max(start, 6)
 
-    # Make start even
     if start % 2 != 0:
         start += 1
-
-    # Ensure end is even (largest even <= end)
     if end % 2 != 0:
         end -= 1
 
     if start > end:
-        # No valid n for this digit length
         return []
 
-    # Number of even values in [start, end]
     num_evens = (end - start) // 2 + 1
-
-    samples = []
-    for _ in range(count):
-        # Choose an index uniformly in [0, num_evens - 1]
-        k = rng.randint(0, num_evens - 1)
-        n = start + 2 * k
-        samples.append(n)
-
-    return samples
+    return [start + 2 * rng.randint(0, num_evens - 1) for _ in range(count)]
 
 
-def goldbach_decomposition(n, subgen):
+class DynamicStats:
     """
-    For an even integer n >= 6, find primes p and q such that n = p + q,
-    by testing subtractor primes p sequentially: 3, 5, 7, 11, ...
+    Tracks global subs counts across all n.
+    """
 
-    Returns:
-        (p, q, tests) where:
-            p, q are gmpy2.mpz primes with p + q = n
-            tests is number of subtractor primes tested (including the successful one)
+    def __init__(self):
+        self._subs_counts = []
 
-    If no decomposition is found up to p <= n - 3 (q >= 2), returns (None, None, tests).
+    def update(self, subs_count):
+        self._subs_counts.append(subs_count)
+
+    @property
+    def has_data(self):
+        return len(self._subs_counts) > 0
+
+    @property
+    def max_subs(self):
+        return max(self._subs_counts) if self._subs_counts else 0
+
+    @property
+    def median_subs(self):
+        return median(self._subs_counts) if self._subs_counts else 0.0
+
+
+# ----------------------------------------------------------------------
+# Worker: parallel search for a single n
+# ----------------------------------------------------------------------
+
+def worker_search(n, start_index, core_name, found_event, result_dict, lock):
+    """
+    Search for a Goldbach decomposition n = p + q with p, q both prime.
+
+    - start_index: 0-based index of the subtractor prime to start from.
+                  index 0 corresponds to p = 3.
+    - core_name: label ("core1", "core2") for debugging.
+
+    Primes are generated *on the fly*:
+      p_0 = 3
+      p_{k+1} = next_prime(p_k)
+
+    We count how many subtractor primes this worker tests until it either:
+      - finds a valid decomposition and wins the race, or
+      - sees found_event set, or
+      - runs out of candidates (q < 2).
     """
     n_mpz = gmpy2.mpz(n)
+
+    # Build up to the starting prime
+    p = gmpy2.mpz(3)
+    for _ in range(start_index):
+        p = gmpy2.next_prime(p)
+
     tests = 0
 
-    # Maximum subtractor p we ever need to consider is n - 2
-    # (since q = n - p >= 2).
-    max_p = n_mpz - 2
-
-    for p in subgen.iter_subtractors(max_p):
-        tests += 1
+    while not found_event.is_set():
         q = n_mpz - p
+
+        # If q < 2, any larger p will only make q smaller -> nothing left to do
         if q < 2:
-            # No valid q from here on
             break
+
+        tests += 1
+
         if gmpy2.is_prime(q):
-            return p, q, tests
+            # Try to claim victory
+            with lock:
+                if not found_event.is_set():
+                    result_dict["p"] = int(p)
+                    result_dict["q"] = int(q)
+                    result_dict["subs_count"] = tests
+                    result_dict["core"] = core_name
+                    found_event.set()
+            break
 
-    return None, None, tests
+        # Move to next subtractor prime
+        p = gmpy2.next_prime(p)
 
+
+def goldbach_parallel_for_n(n, stats, manager):
+    """
+    Run a two-core search for a single n using the current dynamic stats.
+
+    Returns:
+        (p, q, subs_count, winner_core)
+    or
+        (None, None, subs_count, None) if no decomposition was found
+        (subs_count in that case is 0 or partial).
+    """
+    result = manager.dict()
+    found_event = manager.Event()
+    lock = manager.Lock()
+
+    # Convert dynamic stats to starting indices for the cores.
+    # subs_count is "number of primes tested"; index is 0-based.
+    if stats.has_data:
+        median_idx = max(0, int(round(stats.median_subs)) - 1)
+    else:
+        median_idx = 0
+
+    # Two workers:
+    #   core1: start at index 0 (p = 3)
+    #   core2: start at index median_idx
+    start_idx_core1 = 0
+    start_idx_core2 = median_idx
+
+    processes = [
+        mp.Process(
+            target=worker_search,
+            args=(n, start_idx_core1, "core1", found_event, result, lock),
+        ),
+        mp.Process(
+            target=worker_search,
+            args=(n, start_idx_core2, "core2", found_event, result, lock),
+        ),
+    ]
+
+    for p in processes:
+        p.start()
+
+    for p in processes:
+        p.join()
+
+    if "p" in result and "q" in result:
+        return (
+            result["p"],
+            result["q"],
+            result["subs_count"],
+            result.get("core", None),
+        )
+    else:
+        # No decomposition found (should not happen for large even n >= 6).
+        return None, None, 0, None
+
+
+# ----------------------------------------------------------------------
+# Main driver
+# ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Goldbach decomposition sweeper with dynamic subtractor primes."
+        description="Goldbach decomposition sweeper with two-core parallel search."
     )
     parser.add_argument(
         "--sweep",
@@ -187,70 +254,88 @@ def main():
         sys.exit(1)
 
     rng = random.Random(args.seed)
-
-    subgen = SubtractorPrimeGenerator()
-
-    # Stats: for each digit length, store list of test counts
-    tests_per_digit = defaultdict(list)
-    # Also keep global counts
-    global_test_counts = []
+    stats = DynamicStats()
 
     print(f"Sweep digit lengths: {digit_lengths}")
     print(f"Samples per digit length: {args.count}")
     print(f"Random seed: {args.seed}")
     print("")
 
+    # Create a single Manager process to reuse across all n
+    manager = mp.Manager()
+
     for d in digit_lengths:
         print(f"=== Digit length {d} ===")
         ns = sample_even_numbers_of_digit_length(d, args.count, rng)
-
         if not ns:
-            print(f"No valid n values for digit length {d}, skipping.")
-            print("")
+            print(f"No valid n values for digit length {d}, skipping.\n")
             continue
 
-        # For stable, "sort-of evenly distributed" feel, we can sort the sampled ns
-        # (they are still randomly drawn).
         ns.sort()
 
+        digit_start_time = time.perf_counter()
+        n_times = []
+
         for n in ns:
-            p, q, tests = goldbach_decomposition(n, subgen)
+            t0 = time.perf_counter()
+            p, q, subs_count, core_name = goldbach_parallel_for_n(n, stats, manager)
+            t1 = time.perf_counter()
+            elapsed = t1 - t0
+            n_times.append(elapsed)
 
-            if p is None:
-                print(f"n={n}: NO decomposition found after {tests} tests")
-            else:
-                print(f"n={n}: p={p}, q={q}, tests={tests}")
-                tests_per_digit[d].append(tests)
-                global_test_counts.append(tests)
+            if p is None or q is None:
+                print(f"n={n}: NO decomposition found, subs_tried={subs_count}")
+                continue
 
-        # Per-digit summary
-        if tests_per_digit[d]:
-            med = median(tests_per_digit[d])
-            avg = sum(tests_per_digit[d]) / len(tests_per_digit[d])
+            # Update dynamic stats with this n's subs_count
+            stats.update(subs_count)
+
             print(
-                f"Digit length {d} summary: "
-                f"samples={len(tests_per_digit[d])}, "
-                f"median_tests={med}, "
-                f"mean_tests={avg:.3f}"
+                f"n={n}: p={p}, q={q}, subs_count={subs_count}, "
+                f"winner={core_name}, "
+                f"global_median_subs={stats.median_subs:.3f}, "
+                f"global_max_subs={stats.max_subs}"
+            )
+
+        digit_end_time = time.perf_counter()
+        digit_total = digit_end_time - digit_start_time
+        if n_times:
+            avg_per_n = sum(n_times) / len(n_times)
+        else:
+            avg_per_n = 0.0
+
+        # Convert times to milliseconds for display
+        avg_ms_per_n = avg_per_n * 1000.0
+        digit_total_ms = digit_total * 1000.0
+
+        # Per-digit summary snapshot of the dynamic stats
+        if stats.has_data:
+            print(
+                f"Digit length: {d} | "
+                f"Median Sub Count: {stats.median_subs:.3f} | "
+                f"Max Sub Count: {stats.max_subs} | "
+                f"Avg. ms per n: {avg_ms_per_n:.3f} | "
+                f"Digit total ms: {digit_total_ms:.3f}"
             )
         else:
-            print(f"Digit length {d} summary: no successful decompositions recorded.")
+            print(
+                f"Digit length: {d} | "
+                f"No successful decompositions yet | "
+                f"Avg. ms per n: {avg_ms_per_n:.3f} | "
+                f"Digit total ms: {digit_total_ms:.3f}"
+            )
 
         print("")
 
-    # Global summary
-    print("=== Overall summary ===")
-    if global_test_counts:
-        global_median = median(global_test_counts)
-        global_mean = sum(global_test_counts) / len(global_test_counts)
-        print(
-            f"Total successful decompositions: {len(global_test_counts)}\n"
-            f"Global median tests: {global_median}\n"
-            f"Global mean tests: {global_mean:.3f}"
-        )
+    # Final global summary
+    if stats.has_data:
+        print("=== Overall dynamic stats ===")
+        print(f"Global Median Sub Count: {stats.median_subs:.3f}")
+        print(f"Global Max Sub Count:    {stats.max_subs}")
     else:
-        print("No successful decompositions recorded overall (this should not happen for even n >= 6).")
+        print("No decompositions recorded (this should not happen for even n >= 6).")
 
 
 if __name__ == "__main__":
+    # Multiprocessing guard (important on Windows)
     main()
