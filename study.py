@@ -1,426 +1,390 @@
-#!/usr/bin/env python3
-"""
-Goldbach sampler using only Strategy 1 (small subtractor primes),
-collecting as many decompositions as possible per n, with a 10x
-average-per-n cutoff for total q-tests.
-
-Options:
-  --sweep A:B   digit range (e.g. 10:100)
-  --count N     number of random even n per digit (default 1000)
-  --seed S      random seed (default: None)
-
-Output per digit:
-  D: _ | Ms: _ | Ms per n: _ | Max Sub: _ | Avg. Sub: _ |
-      AvgDec: _ | MaxDec: _ | Two+: X/Y | TwoStepAvg: _ | Cut: _ | Skip: _
-
-Where:
-  Ms         = wall-clock ms spent on this digit (all work)
-  Ms per n   = average ms to find the FIRST decomposition (over n with a hit)
-"""
-
-import argparse
-import math
+import gmpy2
 import random
 import time
+import statistics as stats
+import argparse
+import math
 
-import gmpy2
-from gmpy2 import mpz, is_prime, next_prime
+# ---------- random N generation ----------
+
+def random_even_with_digits(d, rng):
+    """
+    Return a random even integer N with exactly d decimal digits,
+    using the provided random.Random instance rng.
+    """
+    low = 10 ** (d - 1)
+    high = 10 ** d - 1
+
+    # Restrict to even numbers in [low, high]
+    low_even = low if low % 2 == 0 else low + 1
+    high_even = high if high % 2 == 0 else high - 1
+
+    if low_even > high_even:
+        raise ValueError(f"No even numbers for digit length {d} (should not happen)")
+
+    # Number of even values in that range
+    count_evens = (high_even - low_even) // 2 + 1
+    offset = rng.randrange(count_evens)
+    return low_even + 2 * offset
 
 
-PRIME_COUNT = 100000      # total subtractor primes to precompute
-WINDOW_SIZE = 20          # use the last 20 digits' means to seed the next
-SMALL_PRIMES = []         # filled by init_primes()
+# ---------- zig-zag generators over subtractor indices ----------
 
+def zigzag_avg_only(avg_idx):
+    """
+    Yield subtractor indices (1-based) in the pattern:
 
-def init_primes():
-    """Precompute PRIME_COUNT subtractor primes starting from 3."""
-    global SMALL_PRIMES
-    if SMALL_PRIMES:
-        return
-    p = mpz(3)
-    SMALL_PRIMES = [p]
-    for _ in range(PRIME_COUNT - 1):
-        p = next_prime(SMALL_PRIMES[-1])
-        SMALL_PRIMES.append(p)
+        1, avg, 2, avg-1, 3, avg+1, 4, avg-2, ...
 
+    avoiding duplicates and indices <= 0.
+    """
+    seen = set()
 
-def get_prime(idx):
-    """Return the idx-th subtractor prime, or None if out of range."""
-    if idx < 0 or idx >= PRIME_COUNT:
+    def add(x):
+        if x > 0 and x not in seen:
+            seen.add(x)
+            return x
         return None
-    return SMALL_PRIMES[idx]
 
+    # Initial two: 1, avg
+    if (v := add(1)) is not None:
+        yield v
+    if (v := add(avg_idx)) is not None:
+        yield v
 
-class Strat1State:
-    """
-    Strategy 1: small subtractor primes with mean-based zig-zag.
-
-    We index primes p[i] = 3,5,7,11,...
-    For a given n and mean_sub, we prepare an index pattern:
-
-        0, mean_index, 1, mean_index-1, 2, mean_index-2, ...
-
-    then tail: mean_index+1, mean_index+2, ...
-
-    and stop when p[i] >= n or we run out of precomputed primes.
-    """
-
-    def __init__(self, mean_sub, n):
-        if mean_sub is None or mean_sub <= 1:
-            mi = 0
-        else:
-            mi = int(math.ceil(mean_sub)) - 1
-            if mi < 0:
-                mi = 0
-        if mi >= PRIME_COUNT:
-            mi = PRIME_COUNT - 1
-
-        self.mean_index = mi
-        self.n = n
-        self.low = 0
-        self.high = self.mean_index
-        self.phase = "zigzag"  # or "tail"
-        self.tail_idx = self.mean_index + 1
-        self.step = 0
-        self.done = False
-
-    def next_candidate(self):
-        """Return next subtractor prime p, or None if exhausted."""
-        if self.done:
-            return None
-
-        n = self.n
-
-        while True:
-            if self.phase == "zigzag":
-                if self.low > self.high:
-                    self.phase = "tail"
-                    continue
-
-                if self.step % 2 == 0:
-                    idx = self.low
-                    self.low += 1
-                else:
-                    idx = self.high
-                    self.high -= 1
-
-                self.step += 1
-                p = get_prime(idx)
-                if p is None:
-                    self.phase = "tail"
-                    continue
-
-                if p >= n:
-                    if self.low > self.high:
-                        self.phase = "tail"
-                    continue
-                return p
-
-            else:  # tail
-                idx = self.tail_idx
-                self.tail_idx += 1
-                p = get_prime(idx)
-                if p is None or p >= n:
-                    self.done = True
-                    return None
-                return p
-
-
-def goldbach_s1(n, mean_sub, avg_checks_per_n):
-    """
-    Strategy 1 only.
-
-    For even n >= 4, search for Goldbach decompositions n = p + q
-    using small subtractor primes p.
-
-    Behavior:
-      - Search the subtractor sequence and collect as many decompositions
-        as possible (up to the precomputed prime limit).
-      - We track:
-          * first_step      : q-test index of the first decomp
-          * second_step     : q-test index of the second decomp (if any)
-          * decomp_count    : total decompositions found
-          * time_to_first_ms: wall-clock ms until the FIRST decomp is found
-                              (or full search time if none)
-      - We stop early if total q-tests for this n exceed
-        10 * avg_checks_per_n (if available).
-
-    Returns:
-      (found_first, found_second,
-       first_step, second_step,
-       decomp_count, total_checks_for_n,
-       cutoff_triggered,
-       time_to_first_ms)
-    """
-    n = mpz(n)
-    if n < 4 or n % 2 != 0:
-        return False, False, 0, 0, 0, 0, False, 0.0
-
-    state = Strat1State(mean_sub, n)
-    total_checks = 0
-
-    decomp_count = 0
-    first_step = 0
-    second_step = 0
-    cutoff_triggered = False
-
-    # Timing for "time to first decomp"
-    start_t = time.perf_counter()
-    time_to_first_ms = 0.0
-    first_time_recorded = False
-
-    # Threshold for total checks for this n
-    cutoff = None
-    if avg_checks_per_n is not None and avg_checks_per_n > 0:
-        cutoff = 10.0 * avg_checks_per_n  # 10x instead of 3x
+    small = 2
+    delta = 1
+    sign = -1  # first wiggle is avg - 1
 
     while True:
-        p = state.next_candidate()
-        if p is None:
+        # Small increasing: 2,3,4,...
+        while small in seen:
+            small += 1
+        if (v := add(small)) is not None:
+            yield v
+        small += 1
+
+        # Wiggle around avg: avg-1, avg+1, avg-2, avg+2, ...
+        tried = 0
+        while tried < 1000:  # safety
+            cand = avg_idx + sign * delta
+            sign *= -1
+            if sign == -1:
+                delta += 1
+            if cand > 0 and cand not in seen:
+                if (v := add(cand)) is not None:
+                    yield v
+                break
+            tried += 1
+
+
+def zigzag_avg_and_med(avg_idx, med_idx):
+    """
+    Yield subtractor indices (1-based) in the pattern:
+
+        1, avg, med,
+        2, avg-1, med+1,
+        3, avg+1, med+2,
+        ...
+
+    avoiding duplicates and indices <= 0.
+    """
+    seen = set()
+
+    def add(x):
+        if x > 0 and x not in seen:
+            seen.add(x)
+            return x
+        return None
+
+    # Initial triple: 1, avg, med
+    if (v := add(1)) is not None:
+        yield v
+    if (v := add(avg_idx)) is not None:
+        yield v
+    if (v := add(med_idx)) is not None:
+        yield v
+
+    next_small = 2
+    delta_avg = 1
+    sign = -1  # first wiggle is avg-1
+    next_med = med_idx + 1
+
+    while True:
+        # small increasing: 2,3,4,5,...
+        while next_small in seen:
+            next_small += 1
+        if (v := add(next_small)) is not None:
+            yield v
+        next_small += 1
+
+        # wiggle around avg: avg-1, avg+1, avg-2, avg+2, ...
+        tried = 0
+        while tried < 1000:
+            cand = avg_idx + sign * delta_avg
+            sign *= -1
+            if sign == -1:
+                delta_avg += 1
+            if cand > 0 and cand not in seen:
+                if (v := add(cand)) is not None:
+                    yield v
+                break
+            tried += 1
+
+        # march upwards from med: med+1, med+2, med+3, ...
+        while next_med in seen:
+            next_med += 1
+        if (v := add(next_med)) is not None:
+            yield v
+        next_med += 1
+
+
+# ---------- prime handling ----------
+
+class PrimeCache:
+    """
+    Precompute a fixed list of subtractor primes: 3,5,7,11,...
+    Access by 1-based index: index 1 -> 3, index 2 -> 5, etc.
+    """
+    def __init__(self, max_count=50000):
+        self.primes = []
+        p = gmpy2.mpz(3)
+        for _ in range(max_count):
+            self.primes.append(p)
+            p = gmpy2.next_prime(p)
+
+    def get_prime(self, index):
+        if index < 1 or index > len(self.primes):
+            raise IndexError(
+                f"Subtractor prime index {index} out of precomputed range "
+                f"(1..{len(self.primes)})"
+            )
+        return self.primes[index - 1]
+
+
+# ---------- search ----------
+
+def search_zigzag(N, prime_cache, avg_center, med_center):
+    """
+    Zig-zag search using fixed centers for this digit length:
+
+      - avg_center: seed for the first decomposition region
+      - med_center: seed for the second decomposition region (or None)
+
+    Returns:
+        first_sub_count, second_sub_count, first_pair, second_pair
+
+    where:
+        first_sub_count, second_sub_count are step numbers (1-based),
+        first_pair = (p1, q1) or None,
+        second_pair = (p2, q2) or None.
+    """
+    first_sub_count = None
+    second_sub_count = None
+    first_pair = None
+    second_pair = None
+    step = 0
+
+    avg_idx = max(1, int(math.ceil(avg_center)))
+
+    if med_center is None:
+        index_gen = zigzag_avg_only(avg_idx)
+    else:
+        med_idx = max(1, int(round(med_center)))
+        index_gen = zigzag_avg_and_med(avg_idx, med_idx)
+
+    for idx in index_gen:
+        try:
+            p = prime_cache.get_prime(idx)
+        except IndexError:
+            break
+        if p >= N:
             break
 
-        q = n - p
-        total_checks += 1
-
-        if is_prime(q):
-            decomp_count += 1
-            if decomp_count == 1:
-                first_step = total_checks
-                if not first_time_recorded:
-                    time_to_first_ms = (time.perf_counter() - start_t) * 1000.0
-                    first_time_recorded = True
-            elif decomp_count == 2:
-                second_step = total_checks
-            # For decomp_count >= 3 we just keep counting; no extra steps tracked.
-
-        # Check cutoff after each test
-        if cutoff is not None and total_checks >= cutoff:
-            cutoff_triggered = True
-            break
-
-    # If we never saw a decomp, record the full search time
-    if not first_time_recorded:
-        time_to_first_ms = (time.perf_counter() - start_t) * 1000.0
-
-    found_first = (decomp_count >= 1)
-    found_second = (decomp_count >= 2)
-
-    return (
-        found_first,
-        found_second,
-        first_step,
-        second_step,
-        decomp_count,
-        total_checks,
-        cutoff_triggered,
-        time_to_first_ms,
-    )
-
-
-def random_even_with_digits(rng, digits):
-    """Draw a random even integer with exactly `digits` decimal digits."""
-    if digits <= 0:
-        raise ValueError("Digit length must be positive.")
-
-    low = 10 ** (digits - 1)
-    high = 10 ** digits - 1
-
-    first_even = low if low % 2 == 0 else low + 1
-    last_even = high if high % 2 == 0 else high - 1
-    if last_even < first_even:
-        raise ValueError(f"No even numbers with {digits} digits.")
-
-    count_evens = ((last_even - first_even) // 2) + 1
-    k = rng.randrange(count_evens)
-    n = first_even + 2 * k
-    if n < 4:
-        n = 4
-    return n
-
-
-def run_sweep(start_digits, end_digits, count_per_digit, seed):
-    if start_digits > end_digits:
-        start_digits, end_digits = end_digits, start_digits
-
-    rng = random.Random(seed)
-    last_digit_means = []  # per-digit means (window of last WINDOW_SIZE digits)
-
-    for D in range(start_digits, end_digits + 1):
-        # Seed mean_sub from the last up-to-20 digit means
-        if last_digit_means:
-            seed_mean = sum(last_digit_means) / len(last_digit_means)
-        else:
-            seed_mean = None
-
-        mean_sub = seed_mean
-
-        # For adapting mean_sub (checks to *first* decomposition)
-        sub_sum = 0
-        sub_count = 0
-
-        digit_sub_sum = 0
-        digit_sub_count = 0
-        digit_max_sub = 0
-        digit_skip = 0
-
-        # For "average time per n" used as cutoff (total checks per n)
-        time_sum_checks = 0.0
-        time_count_checks = 0
-
-        # Decomposition statistics per digit
-        digit_total_decomp_sum = 0
-        digit_max_decomp = 0
-        digit_two_plus = 0
-        second_step_sum = 0
-        second_step_count = 0
-
-        # Cutoff statistics
-        digit_cutoff_hits = 0
-
-        tested_n = 0
-
-        # For Ms per n based on time to first decomp
-        first_time_sum_ms = 0.0
-        first_time_count = 0
-
-        digit_start_time = time.perf_counter()
-
-        for _ in range(count_per_digit):
-            try:
-                n = random_even_with_digits(rng, D)
-            except ValueError:
-                digit_skip = count_per_digit
+        step += 1
+        q = N - p
+        if gmpy2.is_prime(q):
+            if first_sub_count is None:
+                first_sub_count = step
+                first_pair = (int(p), int(q))
+            elif second_sub_count is None:
+                second_sub_count = step
+                second_pair = (int(p), int(q))
                 break
 
-            tested_n += 1
+    return first_sub_count, second_sub_count, first_pair, second_pair
 
-            # Current average total checks per n (for cutoff)
-            avg_checks_per_n = (
-                time_sum_checks / time_count_checks if time_count_checks > 0 else None
+
+# ---------- main sweep logic ----------
+
+def sweep_digit_lengths(start_d, stop_d, step_d, count, seed, show_decomps=False):
+    """
+    Sweep over digit lengths from start_d to stop_d inclusive,
+    stepping by step_d.
+
+    For each digit length D:
+
+      - Use avg/median centers:
+          * avg_seed = previous digit's Avg. Sub if available, else D
+          * med_seed = previous digit's Med. Sub if available, else None
+      - For all Ns of that digit length, use the same zig-zag centers.
+      - Measure the actual Avg. Sub and Med. Sub from the results.
+      - Optionally, collect and print sample decompositions.
+    """
+    rng = random.Random(seed)
+    prime_cache = PrimeCache(max_count=50000)
+
+    prev_avg_first = None
+    prev_med_second = None
+
+    MAX_SAMPLES_PER_DIGIT_FOR_PRINT = 5  # how many Ns to show per digit length
+
+    for d in range(start_d, stop_d + 1, step_d):
+        first_counts = []    # step counts for first decomp
+        second_counts = []   # step counts for second decomp
+
+        # For sanity output
+        sample_decomps = []  # list of (N, first_sub, first_pair, second_sub, second_pair)
+
+        # Choose centers for this digit length
+        if prev_avg_first is not None:
+            avg_seed = prev_avg_first
+        else:
+            # Reasonable starting guess: around D
+            avg_seed = float(d)
+
+        med_seed = prev_med_second  # may be None
+
+        t0 = time.perf_counter()
+
+        for _ in range(count):
+            N = random_even_with_digits(d, rng)
+
+            first_sub, second_sub, first_pair, second_pair = search_zigzag(
+                N,
+                prime_cache,
+                avg_center=avg_seed,
+                med_center=med_seed,
             )
 
-            (
-                found_first,
-                found_second,
-                first_step,
-                second_step,
-                decomp_count,
-                total_checks_for_n,
-                cutoff_triggered,
-                time_to_first_ms,
-            ) = goldbach_s1(n, mean_sub, avg_checks_per_n)
+            if first_sub is None:
+                # No decomposition found (unlikely for these ranges), skip.
+                continue
 
-            # Update per-digit "checks" stats (used only for cutoff for *later* n)
-            time_sum_checks += total_checks_for_n
-            time_count_checks += 1
+            first_counts.append(first_sub)
 
-            # First-hit stats (adaptation + printed Avg. Sub / Max Sub)
-            if found_first and first_step > 0:
-                digit_sub_sum += first_step
-                digit_sub_count += 1
-                if first_step > digit_max_sub:
-                    digit_max_sub = first_step
+            if second_sub is not None:
+                second_counts.append(second_sub)
 
-                sub_sum += first_step
-                sub_count += 1
-                mean_sub = sub_sum / sub_count
+            # Collect some examples for sanity check
+            if show_decomps and len(sample_decomps) < MAX_SAMPLES_PER_DIGIT_FOR_PRINT:
+                sample_decomps.append(
+                    (N, first_sub, first_pair, second_sub, second_pair)
+                )
 
-                # Timing to first decomp
-                first_time_sum_ms += time_to_first_ms
-                first_time_count += 1
-            else:
-                digit_skip += 1
+        elapsed = time.perf_counter() - t0
 
-            # Decomposition counts
-            digit_total_decomp_sum += decomp_count
-            if decomp_count > digit_max_decomp:
-                digit_max_decomp = decomp_count
+        # Aggregate stats for this digit length
+        if first_counts:
+            avg_first = sum(first_counts) / len(first_counts)
+        else:
+            avg_first = float("nan")
 
-            if found_second:
-                digit_two_plus += 1
-                if second_step > 0:
-                    second_step_sum += second_step
-                    second_step_count += 1
+        if second_counts:
+            med_second = stats.median(second_counts)
+            med_str = f"{med_second:.3f}"
+        else:
+            med_second = None
+            med_str = "n/a"
 
-            # Cutoff tracking
-            if cutoff_triggered:
-                digit_cutoff_hits += 1
+        ms_per_n = (elapsed / count) * 1000.0 if count > 0 else float("nan")
 
-        digit_end_time = time.perf_counter()
-        elapsed_ms = (digit_end_time - digit_start_time) * 1000.0
-
-        # Finish this digit: compute its per-digit mean and feed into window
-        if sub_count > 0:
-            digit_mean = sub_sum / sub_count
-            last_digit_means.append(digit_mean)
-            if len(last_digit_means) > WINDOW_SIZE:
-                last_digit_means.pop(0)
-
-        # Ms per n: average time to FIRST decomp (over those with a hit)
-        ms_per_n = (
-            first_time_sum_ms / first_time_count if first_time_count > 0 else 0.0
-        )
-
-        avg_sub = math.ceil(digit_sub_sum / digit_sub_count) if digit_sub_count > 0 else 0
-
-        # Average decompositions per n (including zeros)
-        denom_n = tested_n if tested_n > 0 else 1
-        avg_dec = digit_total_decomp_sum / denom_n
-
-        # Average step of second decomposition where it exists
-        avg_second_step = (
-            second_step_sum / second_step_count if second_step_count > 0 else 0.0
-        )
-
+        # Summary line (2nd vs Sample removed)
         print(
-            f"D: {D} | Ms: {elapsed_ms:.3f} | Ms per n: {ms_per_n:.6f} | "
-            f"Max Sub: {digit_max_sub} | Avg. Sub: {avg_sub} | "
-            f"AvgDec: {avg_dec:.3f} | MaxDec: {digit_max_decomp} | "
-            f"Two+: {digit_two_plus}/{denom_n} | TwoStepAvg: {avg_second_step:.3f} | "
-            f"Cut: {digit_cutoff_hits} | Skip: {digit_skip}"
+            f"D: {d} | "
+            f"Seconds: {elapsed:.3f} | "
+            f"Avg. Sub: {avg_first:.3f} | "
+            f"Med. Sub: {med_str} | "
+            f"Ms per N: {ms_per_n:.3f}"
         )
 
+        # Optional decompositions display
+        if show_decomps and sample_decomps:
+            for (N, first_sub, first_pair, second_sub, second_pair) in sample_decomps:
+                if first_pair is None:
+                    continue
+                p1, q1 = first_pair
+                if second_pair is not None:
+                    p2, q2 = second_pair
+                    print(
+                        f"  N={N} | "
+                        f"1st (step {first_sub}): {p1} + {q1} | "
+                        f"2nd (step {second_sub}): {p2} + {q2}"
+                    )
+                else:
+                    # Only first decomp found; rare, but we handle it.
+                    print(
+                        f"  N={N} | "
+                        f"1st (step {first_sub}): {p1} + {q1} | "
+                        f"2nd: none"
+                    )
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Goldbach sampler (Strategy 1, many decomps, 10x cutoff)."
-    )
-    p.add_argument(
-        "--sweep",
-        type=str,
-        required=True,
-        help="Digit range A:B (e.g. 10:100).",
-    )
-    p.add_argument(
-        "--count",
-        type=int,
-        default=1000,
-        help="Number of random even n per digit (default 1000).",
-    )
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed (default None).",
-    )
-    return p.parse_args()
+        # Seed next digit length with current digit's stats
+        if not math.isnan(avg_first):
+            prev_avg_first = avg_first
+        if med_second is not None:
+            prev_med_second = med_second
 
 
-def main():
-    args = parse_args()
+# ---------- CLI parsing ----------
 
-    try:
-        start_str, end_str = args.sweep.split(":")
-        start_digits = int(start_str)
-        end_digits = int(end_str)
-    except Exception as e:
-        raise SystemExit(
-            f"Invalid --sweep format. Expected A:B, got '{args.sweep}'."
-        ) from e
-
-    init_primes()
-    run_sweep(start_digits, end_digits, args.count, args.seed)
+def parse_sweep(sweep_str):
+    """
+    Parse a sweep spec of the form 'A:B:S' into three ints.
+    """
+    parts = sweep_str.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid --sweep format '{sweep_str}', expected A:B:S")
+    start_d, stop_d, step_d = map(int, parts)
+    return start_d, stop_d, step_d
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Goldbach subtractor statistics with seeded zig-zag search using gmpy2."
+    )
+    parser.add_argument(
+        "--sweep",
+        type=str,
+        required=True,
+        help="Digit-length sweep in the form A:B:S (start:stop:step), e.g. 6:10:2",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1000,
+        help="Number of N samples per digit length (default: 1000)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Random seed for reproducibility (default: 1)",
+    )
+    parser.add_argument(
+        "--show-decomps",
+        action="store_true",
+        help="Print sample decompositions per digit length for sanity checking",
+    )
+
+    args = parser.parse_args()
+    start_d, stop_d, step_d = parse_sweep(args.sweep)
+
+    sweep_digit_lengths(
+        start_d=start_d,
+        stop_d=stop_d,
+        step_d=step_d,
+        count=args.count,
+        seed=args.seed,
+        show_decomps=args.show_decomps,
+    )
