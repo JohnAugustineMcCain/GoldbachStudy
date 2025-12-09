@@ -5,13 +5,8 @@ import statistics as stats
 import argparse
 import math
 
-# ---------- random N generation ----------
-
 def random_even_with_digits(d, rng):
-    """
-    Return a random even integer N with exactly d decimal digits,
-    using the provided random.Random instance rng.
-    """
+
     low = 10 ** (d - 1)
     high = 10 ** d - 1
 
@@ -31,13 +26,6 @@ def random_even_with_digits(d, rng):
 # ---------- zig-zag generators over subtractor indices ----------
 
 def zigzag_avg_only(avg_idx):
-    """
-    Yield subtractor indices (1-based) in the pattern:
-
-        1, avg, 2, avg-1, 3, avg+1, 4, avg-2, ...
-
-    avoiding duplicates and indices <= 0.
-    """
     seen = set()
 
     def add(x):
@@ -79,16 +67,6 @@ def zigzag_avg_only(avg_idx):
 
 
 def zigzag_avg_and_med(avg_idx, med_idx):
-    """
-    Yield subtractor indices (1-based) in the pattern:
-
-        1, avg, med,
-        2, avg-1, med+1,
-        3, avg+1, med+2,
-        ...
-
-    avoiding duplicates and indices <= 0.
-    """
     seen = set()
 
     def add(x):
@@ -131,21 +109,13 @@ def zigzag_avg_and_med(avg_idx, med_idx):
                 break
             tried += 1
 
-        # march upwards from med: med+1, med+2, med+3, ...
         while next_med in seen:
             next_med += 1
         if (v := add(next_med)) is not None:
             yield v
         next_med += 1
 
-
-# ---------- prime handling ----------
-
 class PrimeCache:
-    """
-    Precompute a fixed list of subtractor primes: 3,5,7,11,...
-    Access by 1-based index: index 1 -> 3, index 2 -> 5, etc.
-    """
     def __init__(self, max_count=50000):
         self.primes = []
         p = gmpy2.mpz(3)
@@ -161,24 +131,8 @@ class PrimeCache:
             )
         return self.primes[index - 1]
 
-
-# ---------- search ----------
-
 def search_zigzag(N, prime_cache, avg_center, med_center):
-    """
-    Zig-zag search using fixed centers for this digit length:
 
-      - avg_center: seed for the first decomposition region
-      - med_center: seed for the second decomposition region (or None)
-
-    Returns:
-        first_sub_count, second_sub_count, first_pair, second_pair
-
-    where:
-        first_sub_count, second_sub_count are step numbers (1-based),
-        first_pair = (p1, q1) or None,
-        second_pair = (p2, q2) or None.
-    """
     first_sub_count = None
     second_sub_count = None
     first_pair = None
@@ -214,23 +168,7 @@ def search_zigzag(N, prime_cache, avg_center, med_center):
 
     return first_sub_count, second_sub_count, first_pair, second_pair
 
-
-# ---------- main sweep logic ----------
-
 def sweep_digit_lengths(start_d, stop_d, step_d, count, seed, show_decomps=False):
-    """
-    Sweep over digit lengths from start_d to stop_d inclusive,
-    stepping by step_d.
-
-    For each digit length D:
-
-      - Use avg/median centers:
-          * avg_seed = previous digit's Avg. Sub if available, else D
-          * med_seed = previous digit's Med. Sub if available, else None
-      - For all Ns of that digit length, use the same zig-zag centers.
-      - Measure the actual Avg. Sub and Med. Sub from the results.
-      - Optionally, collect and print sample decompositions.
-    """
     rng = random.Random(seed)
     prime_cache = PrimeCache(max_count=50000)
 
@@ -243,14 +181,11 @@ def sweep_digit_lengths(start_d, stop_d, step_d, count, seed, show_decomps=False
         first_counts = []    # step counts for first decomp
         second_counts = []   # step counts for second decomp
 
-        # For sanity output
         sample_decomps = []  # list of (N, first_sub, first_pair, second_sub, second_pair)
 
-        # Choose centers for this digit length
         if prev_avg_first is not None:
             avg_seed = prev_avg_first
         else:
-            # Reasonable starting guess: around D
             avg_seed = float(d)
 
         med_seed = prev_med_second  # may be None
@@ -268,7 +203,6 @@ def sweep_digit_lengths(start_d, stop_d, step_d, count, seed, show_decomps=False
             )
 
             if first_sub is None:
-                # No decomposition found (unlikely for these ranges), skip.
                 continue
 
             first_counts.append(first_sub)
@@ -276,7 +210,6 @@ def sweep_digit_lengths(start_d, stop_d, step_d, count, seed, show_decomps=False
             if second_sub is not None:
                 second_counts.append(second_sub)
 
-            # Collect some examples for sanity check
             if show_decomps and len(sample_decomps) < MAX_SAMPLES_PER_DIGIT_FOR_PRINT:
                 sample_decomps.append(
                     (N, first_sub, first_pair, second_sub, second_pair)
@@ -284,7 +217,6 @@ def sweep_digit_lengths(start_d, stop_d, step_d, count, seed, show_decomps=False
 
         elapsed = time.perf_counter() - t0
 
-        # Aggregate stats for this digit length
         if first_counts:
             avg_first = sum(first_counts) / len(first_counts)
         else:
@@ -299,7 +231,6 @@ def sweep_digit_lengths(start_d, stop_d, step_d, count, seed, show_decomps=False
 
         ms_per_n = (elapsed / count) * 1000.0 if count > 0 else float("nan")
 
-        # Summary line (2nd vs Sample removed)
         print(
             f"D: {d} | "
             f"Seconds: {elapsed:.3f} | "
@@ -308,7 +239,6 @@ def sweep_digit_lengths(start_d, stop_d, step_d, count, seed, show_decomps=False
             f"Ms per N: {ms_per_n:.3f}"
         )
 
-        # Optional decompositions display
         if show_decomps and sample_decomps:
             for (N, first_sub, first_pair, second_sub, second_pair) in sample_decomps:
                 if first_pair is None:
@@ -329,19 +259,13 @@ def sweep_digit_lengths(start_d, stop_d, step_d, count, seed, show_decomps=False
                         f"2nd: none"
                     )
 
-        # Seed next digit length with current digit's stats
         if not math.isnan(avg_first):
             prev_avg_first = avg_first
         if med_second is not None:
             prev_med_second = med_second
 
-
-# ---------- CLI parsing ----------
-
 def parse_sweep(sweep_str):
-    """
-    Parse a sweep spec of the form 'A:B:S' into three ints.
-    """
+
     parts = sweep_str.split(":")
     if len(parts) != 3:
         raise ValueError(f"Invalid --sweep format '{sweep_str}', expected A:B:S")
