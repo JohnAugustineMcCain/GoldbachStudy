@@ -12,6 +12,10 @@ Options:
 Output per digit:
   D: _ | Ms: _ | Ms per n: _ | Max Sub: _ | Avg. Sub: _ |
       AvgDec: _ | MaxDec: _ | Two+: X/Y | TwoStepAvg: _ | Cut: _ | Skip: _
+
+Where:
+  Ms         = wall-clock ms spent on this digit (all work)
+  Ms per n   = average ms to find the FIRST decomposition (over n with a hit)
 """
 
 import argparse
@@ -133,19 +137,24 @@ def goldbach_s1(n, mean_sub, avg_checks_per_n):
       - Search the subtractor sequence and collect as many decompositions
         as possible (up to the precomputed prime limit).
       - We track:
-          * first_step: q-test index of the first decomp
-          * second_step: q-test index of the second decomp (if any)
-          * decomp_count: total decompositions found
+          * first_step      : q-test index of the first decomp
+          * second_step     : q-test index of the second decomp (if any)
+          * decomp_count    : total decompositions found
+          * time_to_first_ms: wall-clock ms until the FIRST decomp is found
+                              (or full search time if none)
       - We stop early if total q-tests for this n exceed
         10 * avg_checks_per_n (if available).
 
     Returns:
-      (found_first, found_second, first_step, second_step,
-       decomp_count, total_checks_for_n, cutoff_triggered)
+      (found_first, found_second,
+       first_step, second_step,
+       decomp_count, total_checks_for_n,
+       cutoff_triggered,
+       time_to_first_ms)
     """
     n = mpz(n)
     if n < 4 or n % 2 != 0:
-        return False, False, 0, 0, 0, 0, False
+        return False, False, 0, 0, 0, 0, False, 0.0
 
     state = Strat1State(mean_sub, n)
     total_checks = 0
@@ -154,6 +163,11 @@ def goldbach_s1(n, mean_sub, avg_checks_per_n):
     first_step = 0
     second_step = 0
     cutoff_triggered = False
+
+    # Timing for "time to first decomp"
+    start_t = time.perf_counter()
+    time_to_first_ms = 0.0
+    first_time_recorded = False
 
     # Threshold for total checks for this n
     cutoff = None
@@ -172,6 +186,9 @@ def goldbach_s1(n, mean_sub, avg_checks_per_n):
             decomp_count += 1
             if decomp_count == 1:
                 first_step = total_checks
+                if not first_time_recorded:
+                    time_to_first_ms = (time.perf_counter() - start_t) * 1000.0
+                    first_time_recorded = True
             elif decomp_count == 2:
                 second_step = total_checks
             # For decomp_count >= 3 we just keep counting; no extra steps tracked.
@@ -180,6 +197,10 @@ def goldbach_s1(n, mean_sub, avg_checks_per_n):
         if cutoff is not None and total_checks >= cutoff:
             cutoff_triggered = True
             break
+
+    # If we never saw a decomp, record the full search time
+    if not first_time_recorded:
+        time_to_first_ms = (time.perf_counter() - start_t) * 1000.0
 
     found_first = (decomp_count >= 1)
     found_second = (decomp_count >= 2)
@@ -192,6 +213,7 @@ def goldbach_s1(n, mean_sub, avg_checks_per_n):
         decomp_count,
         total_checks,
         cutoff_triggered,
+        time_to_first_ms,
     )
 
 
@@ -242,8 +264,8 @@ def run_sweep(start_digits, end_digits, count_per_digit, seed):
         digit_skip = 0
 
         # For "average time per n" used as cutoff (total checks per n)
-        time_sum = 0.0
-        time_count = 0
+        time_sum_checks = 0.0
+        time_count_checks = 0
 
         # Decomposition statistics per digit
         digit_total_decomp_sum = 0
@@ -257,7 +279,11 @@ def run_sweep(start_digits, end_digits, count_per_digit, seed):
 
         tested_n = 0
 
-        start_time = time.perf_counter()
+        # For Ms per n based on time to first decomp
+        first_time_sum_ms = 0.0
+        first_time_count = 0
+
+        digit_start_time = time.perf_counter()
 
         for _ in range(count_per_digit):
             try:
@@ -269,7 +295,9 @@ def run_sweep(start_digits, end_digits, count_per_digit, seed):
             tested_n += 1
 
             # Current average total checks per n (for cutoff)
-            avg_checks_per_n = (time_sum / time_count) if time_count > 0 else None
+            avg_checks_per_n = (
+                time_sum_checks / time_count_checks if time_count_checks > 0 else None
+            )
 
             (
                 found_first,
@@ -279,11 +307,12 @@ def run_sweep(start_digits, end_digits, count_per_digit, seed):
                 decomp_count,
                 total_checks_for_n,
                 cutoff_triggered,
+                time_to_first_ms,
             ) = goldbach_s1(n, mean_sub, avg_checks_per_n)
 
-            # Update per-digit time stats (used only for cutoff for *later* n)
-            time_sum += total_checks_for_n
-            time_count += 1
+            # Update per-digit "checks" stats (used only for cutoff for *later* n)
+            time_sum_checks += total_checks_for_n
+            time_count_checks += 1
 
             # First-hit stats (adaptation + printed Avg. Sub / Max Sub)
             if found_first and first_step > 0:
@@ -295,6 +324,10 @@ def run_sweep(start_digits, end_digits, count_per_digit, seed):
                 sub_sum += first_step
                 sub_count += 1
                 mean_sub = sub_sum / sub_count
+
+                # Timing to first decomp
+                first_time_sum_ms += time_to_first_ms
+                first_time_count += 1
             else:
                 digit_skip += 1
 
@@ -313,6 +346,9 @@ def run_sweep(start_digits, end_digits, count_per_digit, seed):
             if cutoff_triggered:
                 digit_cutoff_hits += 1
 
+        digit_end_time = time.perf_counter()
+        elapsed_ms = (digit_end_time - digit_start_time) * 1000.0
+
         # Finish this digit: compute its per-digit mean and feed into window
         if sub_count > 0:
             digit_mean = sub_sum / sub_count
@@ -320,9 +356,10 @@ def run_sweep(start_digits, end_digits, count_per_digit, seed):
             if len(last_digit_means) > WINDOW_SIZE:
                 last_digit_means.pop(0)
 
-        end_time = time.perf_counter()
-        elapsed_ms = (end_time - start_time) * 1000.0
-        ms_per_n = elapsed_ms / count_per_digit if count_per_digit > 0 else 0.0
+        # Ms per n: average time to FIRST decomp (over those with a hit)
+        ms_per_n = (
+            first_time_sum_ms / first_time_count if first_time_count > 0 else 0.0
+        )
 
         avg_sub = math.ceil(digit_sub_sum / digit_sub_count) if digit_sub_count > 0 else 0
 
@@ -331,7 +368,9 @@ def run_sweep(start_digits, end_digits, count_per_digit, seed):
         avg_dec = digit_total_decomp_sum / denom_n
 
         # Average step of second decomposition where it exists
-        avg_second_step = (second_step_sum / second_step_count) if second_step_count > 0 else 0.0
+        avg_second_step = (
+            second_step_sum / second_step_count if second_step_count > 0 else 0.0
+        )
 
         print(
             f"D: {D} | Ms: {elapsed_ms:.3f} | Ms per n: {ms_per_n:.6f} | "
