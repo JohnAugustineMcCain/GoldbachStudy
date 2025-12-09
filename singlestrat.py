@@ -11,7 +11,6 @@ from gmpy2 import mpz, is_prime, next_prime
 SMALL_PRIMES = [mpz(3)]  # 3, 5, 7, 11, ...
 
 def ensure_prime_index(idx: int) -> mpz:
-    """Ensure SMALL_PRIMES has a prime at position idx and return it."""
     while len(SMALL_PRIMES) <= idx:
         SMALL_PRIMES.append(next_prime(SMALL_PRIMES[-1]))
     return SMALL_PRIMES[idx]
@@ -113,9 +112,6 @@ def random_even_with_digits(rng: random.Random, digits: int) -> int:
         n = 4
     return n
 
-
-# ---- Sweep logic ----
-
 def run_sweep(start_digits: int, end_digits: int, count_per_digit: int, seed: int | None) -> None:
     if start_digits > end_digits:
         start_digits, end_digits = end_digits, start_digits
@@ -167,9 +163,6 @@ def run_sweep(start_digits: int, end_digits: int, count_per_digit: int, seed: in
             f"Max Sub: {digit_max_sub} | Avg. Sub: {avg_sub} | Skip: {digit_skip}"
         )
 
-
-# ---- CLI ----
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Minimal Goldbach sampler (Strategy 1 only).")
     p.add_argument(
@@ -203,7 +196,6 @@ def main() -> None:
         raise SystemExit(f"Invalid --sweep format. Expected A:B, got '{args.sweep}'.") from e
 
     run_sweep(start_digits, end_digits, args.count, args.seed)
-
 
 if __name__ == "__main__":
     main()
