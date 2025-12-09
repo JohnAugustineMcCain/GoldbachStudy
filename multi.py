@@ -23,41 +23,42 @@ def goldbach_s1_first_phase(n: int, mean_sub: float | None) -> tuple[bool, int, 
       indices 0..mean_index in the pattern:
         0, mean_index, 1, mean_index-1, 2, mean_index-2, ...
 
-    We do *not* enter the tail phase. We:
+    We do *not* enter the tail phase.
 
+    We:
       - Count how many q-tests we do (total_checks),
-      - Count how many decompositions we see (decomp_count),
+      - Count how many decompositions we see in this phase (decomp_count),
       - Record the step where the *first* decomposition appears (first_step).
 
     Returns:
       (found, first_step, total_checks, decomp_count)
 
       found       : True iff at least one decomposition found
-      first_step  : step index where the first decomposition was found
-                    (1-based, counting only q-tests), undefined if found=False
-      total_checks: total number of q primality checks in this first phase
-      decomp_count: how many decompositions found in this first phase
+      first_step  : step index where the first decomp was found
+                    (1-based, counting only q-tests) if found else 0
+      total_checks: total number of q primality checks in this phase
+      decomp_count: how many decompositions found in this phase
     """
-    n = mpz(n)
-    if n < 4 or n % 2 != 0:
+    n_mpz = mpz(n)
+    if n_mpz < 4 or n_mpz % 2 != 0:
         return False, 0, 0, 0
 
-    # Derive mean_index from mean_sub (same logic as Strat1State.__init__)
+    # Derive mean_index from mean_sub (same as your Strat1State.__init__)
     if mean_sub is None or mean_sub <= 1:
         mean_index = 0
     else:
         mi = int(math.ceil(mean_sub)) - 1
         mean_index = mi if mi >= 0 else 0
 
-    # Make sure we have primes up to mean_index
+    # Ensure primes up to mean_index exist
     ensure_prime_index(mean_index)
 
     low = 0
     high = mean_index
-    step_idx = 0        # zigzag step counter over indices
+    step_idx = 0        # zigzag steps over indices
     total_checks = 0    # number of q primality tests
     decomp_count = 0
-    first_step = None
+    first_step = 0
 
     # Zigzag over [0, mean_index] only
     while low <= high:
@@ -73,20 +74,18 @@ def goldbach_s1_first_phase(n: int, mean_sub: float | None) -> tuple[bool, int, 
             continue
 
         p = ensure_prime_index(idx)
-        if p >= n:
+        if p >= n_mpz:
             continue
 
-        q = n - p
+        q = n_mpz - p
         total_checks += 1
         if is_prime(q):
             decomp_count += 1
-            if first_step is None:
+            if first_step == 0:
                 first_step = total_checks
 
     found = (decomp_count > 0)
-    if not found:
-        return False, 0, total_checks, 0
-    return True, first_step, total_checks, decomp_count
+    return found, first_step, total_checks, decomp_count
 
 
 def random_even_with_digits(rng: random.Random, digits: int) -> int:
@@ -124,12 +123,11 @@ def run_sweep(start_digits: int, end_digits: int, count_per_digit: int, seed: in
         digit_sub_sum = 0
         digit_sub_count = 0
         digit_max_sub = 0
-        digit_skip = 0
 
-        # new: decomp stats per digit (first-phase only)
         digit_decomp_sum = 0
-        digit_decomp_count = 0
         digit_max_decomp = 0
+        tested_n = 0       # how many n we actually sampled
+        digit_skip = 0     # only for true generation failures
 
         start_time = time.perf_counter()
 
@@ -140,38 +138,43 @@ def run_sweep(start_digits: int, end_digits: int, count_per_digit: int, seed: in
                 digit_skip = count_per_digit
                 break
 
-            found, first_step, total_checks, decomp_count = goldbach_s1_first_phase(n, mean_sub)
-            if found:
-                # first_step is the "subtractor count" we adapt on
+            tested_n += 1
+
+            found, first_step, total_checks, decomp_count =
+                goldbach_s1_first_phase(n, mean_sub)
+
+            # Decomposition stats: we care about the count *per n*,
+            # even if it's 0 or 1.
+            digit_decomp_sum += decomp_count
+            if decomp_count > digit_max_decomp:
+                digit_max_decomp = decomp_count
+
+            # Adapt mean_sub + subtractor stats only if a first decomp appeared
+            if found and first_step > 0:
                 digit_sub_sum += first_step
                 digit_sub_count += 1
                 if first_step > digit_max_sub:
                     digit_max_sub = first_step
 
-                # per-digit mean_sub adapts from the first-step (not total_checks)
                 sub_sum += first_step
                 sub_count += 1
                 mean_sub = sub_sum / sub_count
-
-                # record decomposition counts in the first phase
-                digit_decomp_sum += decomp_count
-                digit_decomp_count += 1
-                if decomp_count > digit_max_decomp:
-                    digit_max_decomp = decomp_count
-            else:
-                digit_skip += 1
+            # If not found, we just don't update the mean; n is still counted in decompositions.
 
         end_time = time.perf_counter()
         elapsed_ms = (end_time - start_time) * 1000.0
         ms_per_n = elapsed_ms / count_per_digit if count_per_digit > 0 else 0.0
 
         avg_sub = math.ceil(digit_sub_sum / digit_sub_count) if digit_sub_count > 0 else 0
-        avg_decomp = (digit_decomp_sum / digit_decomp_count) if digit_decomp_count > 0 else 0.0
+
+        # Average decompositions per n in the first phase, including zeros:
+        effective_n = tested_n if tested_n > 0 else 1
+        avg_decomp_per_n = digit_decomp_sum / effective_n
 
         print(
             f"D: {D} | Ms: {elapsed_ms:.3f} | Ms per n: {ms_per_n:.6f} | "
             f"Max Sub: {digit_max_sub} | Avg. Sub: {avg_sub} | "
-            f"Avg Dec: {avg_decomp:.3f} | Max Dec: {digit_max_decomp} | "
+            f"Avg Dec: {avg_decomp_per_n:.3f} | Max Dec: {digit_max_decomp} | "
             f"Skip: {digit_skip}"
         )
 
@@ -208,8 +211,7 @@ def main() -> None:
     except Exception as e:
         raise SystemExit(f"Invalid --sweep format. Expected A:B, got '{args.sweep}'.") from e
 
-    run_sweep(start_digits, end_digits, args.count, args.seed)
-
+        run_sweep(start_digits, end_digits, args.count, args.seed)
 
 if __name__ == "__main__":
     main()
