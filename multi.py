@@ -1,444 +1,95 @@
 #!/usr/bin/env python3
-"""
-Goldbach sampler with 3 strategies and 2-core parallelism.
-
-Core 1 (worker_core1): Strategy 1 + Strategy 2
-  - S1: small subtractor primes (precomputed table of 100000 primes).
-        For each n:
-          * search subtractor primes p
-          * count q-tests (is_prime(n - p))
-          * record step of 1st and 2nd decompositions
-          * stop after a 3rd decomposition (just record that it happened)
-  - S2: around n/2 (only runs, conceptually, for stats; S1 is independent).
-        For each n:
-          * search odd p >= n/2
-          * require p and q = n - p both prime
-          * record step of 1st decomposition if any
-
-Core 2 (worker_core2): Strategy 3
-  - S3: around sqrt(n).
-        For each n:
-          * search odd p near floor(sqrt(n))
-          * require p and q = n - p both prime
-          * record step of 1st decomposition if any
-
-Heuristic adaptation:
-  - For S1, S2, S3 we track per-digit mean *total steps* (q-tests) per strategy.
-  - For digit D, each strategy’s initial mean is seeded from a moving window
-    of the last 20 digits’ per-digit means for that strategy.
-  - Within digit D, a strategy’s mean is updated only on ns where it finds a
-    first decomposition.
-
-We only treat an n as “skipped” if *S1* fails to find a first decomposition
-(i.e., no Goldbach decomposition found by subtractor primes within our prime table).
-S2/S3 failures are allowed and simply not used in their averages.
-
-CLI:
-  --sweep A:B   digit range inclusive (e.g. 20:50)
-  --count N     number of random even n per digit (default 1000)
-  --seed S      RNG seed (default None)
-"""
 
 import argparse
 import math
 import random
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import gmpy2
-from gmpy2 import mpz, is_prime, next_prime, isqrt
+from gmpy2 import mpz, is_prime, next_prime
 
-# ----- Global configuration -----
+SMALL_PRIMES = [mpz(3)]  # 3, 5, 7, 11, ...
 
-PRIME_COUNT = 100000      # number of subtractor primes for S1
-WINDOW_SIZE = 20          # moving-window length for per-strategy means
-SMALL_PRIMES = []         # filled by init_primes()
-
-
-# ----- Prime table for S1 -----
-
-def init_primes():
-    """Precompute PRIME_COUNT subtractor primes starting from 3."""
-    global SMALL_PRIMES
-    if SMALL_PRIMES:
-        return
-    p = mpz(3)
-    SMALL_PRIMES = [p]
-    for _ in range(PRIME_COUNT - 1):
-        p = next_prime(p)
-        SMALL_PRIMES.append(p)
+def ensure_prime_index(idx: int) -> mpz:
+    while len(SMALL_PRIMES) <= idx:
+        SMALL_PRIMES.append(next_prime(SMALL_PRIMES[-1]))
+    return SMALL_PRIMES[idx]
 
 
-def get_prime(idx: int):
-    """Return idx-th subtractor prime, or None if out of range."""
-    if 0 <= idx < PRIME_COUNT:
-        return SMALL_PRIMES[idx]
-    return None
-
-
-# ----- Strategy 1: small subtractor primes, mean-based zig-zag -----
-
-class Strat1State:
+def goldbach_s1_first_phase(n: int, mean_sub: float | None) -> tuple[bool, int, int, int]:
     """
-    Strategy 1: subtractor primes p[i] = 3,5,7,11,... using a mean-based zig-zag.
+    Strategy 1, but we ONLY run the first zigzag phase:
 
-    For a given n and mean_sub, define:
-      mean_index = ceil(mean_sub) - 1 (clamped into [0, PRIME_COUNT-1])
+      indices 0..mean_index in the pattern:
+        0, mean_index, 1, mean_index-1, 2, mean_index-2, ...
 
-    Index pattern:
-      0, mean_index, 1, mean_index-1, 2, mean_index-2, ...
-    then:
-      mean_index+1, mean_index+2, ...
+    We do *not* enter the tail phase. We:
 
-    Stop when p >= n or we run out of prime table.
-    """
-
-    def __init__(self, mean_sub, n: mpz):
-        if mean_sub is None or mean_sub <= 1:
-            mi = 0
-        else:
-            mi = int(math.ceil(mean_sub)) - 1
-            mi = max(mi, 0)
-        if mi >= PRIME_COUNT:
-            mi = PRIME_COUNT - 1
-
-        self.mean_index = mi
-        self.n = n
-
-        self.low = 0
-        self.high = self.mean_index
-        self.phase = "zigzag"
-        self.tail_idx = self.mean_index + 1
-        self.step = 0
-        self.done = False
-
-    def next_candidate(self):
-        if self.done:
-            return None
-
-        n = self.n
-        while True:
-            if self.phase == "zigzag":
-                if self.low > self.high:
-                    self.phase = "tail"
-                    continue
-                if self.step % 2 == 0:
-                    idx = self.low
-                    self.low += 1
-                else:
-                    idx = self.high
-                    self.high -= 1
-                self.step += 1
-
-                p = get_prime(idx)
-                if p is None:
-                    self.phase = "tail"
-                    continue
-                if p >= n:
-                    if self.low > self.high:
-                        self.phase = "tail"
-                    continue
-                return p
-            else:
-                idx = self.tail_idx
-                self.tail_idx += 1
-                p = get_prime(idx)
-                if p is None or p >= n:
-                    self.done = True
-                    return None
-                return p
-
-
-# ----- Strategy 2: around n/2, mean-distance zig-zag -----
-
-class Strat2State:
-    """
-    Strategy 2: around n/2 in step space.
-
-    mid = n//2, start = first odd >= mid.
-    Steps k >= 0, p = start + 2*k.
-
-    mean_k = ceil(mean_mid_steps)
-    Pattern over k:
-      0, mean_k, 1, mean_k-1, 2, mean_k-2, ...
-    then:
-      mean_k+1, mean_k+2, ...
-    """
-
-    def __init__(self, mean_steps, n: mpz):
-        self.n = n
-        mid = n // 2
-        self.mid = mid
-        self.start = mid if mid % 2 == 1 else mid + 1
-        if self.start >= n:
-            self.done = True
-            return
-        self.done = False
-
-        if mean_steps is None or mean_steps <= 0:
-            mk = 0
-        else:
-            mk = int(math.ceil(mean_steps))
-            mk = max(mk, 0)
-        self.mean_k = mk
-
-        self.low = 0
-        self.high = self.mean_k
-        self.phase = "zigzag"
-        self.tail_k = self.mean_k + 1
-        self.step = 0
-
-    def next_candidate(self):
-        if self.done:
-            return None
-        n = self.n
-        while True:
-            if self.phase == "zigzag":
-                if self.low > self.high:
-                    self.phase = "tail"
-                    continue
-                if self.step % 2 == 0:
-                    k = self.low
-                    self.low += 1
-                else:
-                    k = self.high
-                    self.high -= 1
-                self.step += 1
-
-                if k < 0:
-                    continue
-                p = self.start + 2 * k
-                if p >= n:
-                    if self.low > self.high:
-                        self.phase = "tail"
-                    else:
-                        self.done = True
-                        return None
-                    continue
-                return p
-            else:
-                k = self.tail_k
-                self.tail_k += 1
-                p = self.start + 2 * k
-                if p >= n:
-                    self.done = True
-                    return None
-                return p
-
-
-# ----- Strategy 3: around sqrt(n), mean-distance zig-zag -----
-
-class Strat3State:
-    """
-    Strategy 3: around sqrt(n) in step space.
-
-    root = floor(sqrt(n)), start = first odd >= root.
-    Steps k >= 0, p = start + 2*k.
-
-    mean_k = ceil(mean_sqrt_steps)
-    Pattern over k:
-      0, mean_k, 1, mean_k-1, 2, mean_k-2, ...
-    then:
-      mean_k+1, mean_k+2, ...
-    """
-
-    def __init__(self, mean_steps, n: mpz):
-        self.n = n
-        root = isqrt(n)
-        self.root = root
-        self.start = root if root % 2 == 1 else root + 1
-        if self.start >= n:
-            self.done = True
-            return
-        self.done = False
-
-        if mean_steps is None or mean_steps <= 0:
-            mk = 0
-        else:
-            mk = int(math.ceil(mean_steps))
-            mk = max(mk, 0)
-        self.mean_k = mk
-
-        self.low = 0
-        self.high = self.mean_k
-        self.phase = "zigzag"
-        self.tail_k = self.mean_k + 1
-        self.step = 0
-
-    def next_candidate(self):
-        if self.done:
-            return None
-        n = self.n
-        while True:
-            if self.phase == "zigzag":
-                if self.low > self.high:
-                    self.phase = "tail"
-                    continue
-                if self.step % 2 == 0:
-                    k = self.low
-                    self.low += 1
-                else:
-                    k = self.high
-                    self.high -= 1
-                self.step += 1
-
-                if k < 0:
-                    continue
-                p = self.start + 2 * k
-                if p >= n:
-                    if self.low > self.high:
-                        self.phase = "tail"
-                    else:
-                        self.done = True
-                        return None
-                    continue
-                return p
-            else:
-                k = self.tail_k
-                self.tail_k += 1
-                p = self.start + 2 * k
-                if p >= n:
-                    self.done = True
-                    return None
-                return p
-
-
-# ----- Core1: S1 up to 3 decomps, S2 one decomp -----
-
-def s1_find_up_to_three(n: int, mean_sub):
-    """
-    Strategy 1 on n, using mean_sub.
+      - Count how many q-tests we do (total_checks),
+      - Count how many decompositions we see (decomp_count),
+      - Record the step where the *first* decomposition appears (first_step).
 
     Returns:
-      (step_first, step_second, step_third, total_steps)
+      (found, first_step, total_checks, decomp_count)
 
-    step_first  = step index where first decomposition found (or None)
-    step_second = step index for second decomposition (or None)
-    step_third  = step index for third decomposition (or None)
-    total_steps = total q-tests performed
+      found       : True iff at least one decomposition found
+      first_step  : step index where the first decomposition was found
+                    (1-based, counting only q-tests), undefined if found=False
+      total_checks: total number of q primality checks in this first phase
+      decomp_count: how many decompositions found in this first phase
     """
-    init_primes()
-    state = Strat1State(mean_sub, mpz(n))
-    total_steps = 0
-    first = None
-    second = None
-    third = None
-    n_mpz = mpz(n)
+    n = mpz(n)
+    if n < 4 or n % 2 != 0:
+        return False, 0, 0, 0
 
-    while True:
-        p = state.next_candidate()
-        if p is None:
-            break
-        q = n_mpz - p
-        total_steps += 1
-        if is_prime(q):
-            if first is None:
-                first = total_steps
-            elif second is None:
-                second = total_steps
-            elif third is None:
-                third = total_steps
-                break
+    # Derive mean_index from mean_sub (same logic as Strat1State.__init__)
+    if mean_sub is None or mean_sub <= 1:
+        mean_index = 0
+    else:
+        mi = int(math.ceil(mean_sub)) - 1
+        mean_index = mi if mi >= 0 else 0
 
-    return first, second, third, total_steps
+    # Make sure we have primes up to mean_index
+    ensure_prime_index(mean_index)
 
+    low = 0
+    high = mean_index
+    step_idx = 0        # zigzag step counter over indices
+    total_checks = 0    # number of q primality tests
+    decomp_count = 0
+    first_step = None
 
-def s2_find_one(n: int, mean_mid_steps):
-    """
-    Strategy 2 on n, using mean_mid_steps.
+    # Zigzag over [0, mean_index] only
+    while low <= high:
+        if step_idx % 2 == 0:
+            idx = low
+            low += 1
+        else:
+            idx = high
+            high -= 1
+        step_idx += 1
 
-    Returns:
-      (step_first, total_steps)
-
-    step_first  = step index where first decomposition found (or None)
-    total_steps = total q-tests performed
-    """
-    state = Strat2State(mean_mid_steps, mpz(n))
-    total_steps = 0
-    first = None
-    n_mpz = mpz(n)
-
-    while True:
-        p = state.next_candidate()
-        if p is None:
-            break
-        if not is_prime(p):
+        if idx < 0:
             continue
-        q = n_mpz - p
-        total_steps += 1
-        if is_prime(q):
-            first = total_steps
-            break
 
-    return first, total_steps
-
-
-def worker_core1(args):
-    """
-    Worker for core 1 (process 1): S1 and S2.
-
-    Input: (n, mean_sub, mean_mid_steps)
-    Output:
-      (s1_first, s1_second, s1_third, s1_total,
-       s2_first, s2_total)
-    """
-    n, mean_sub, mean_mid_steps = args
-    init_primes()
-
-    s1_first, s1_second, s1_third, s1_total = s1_find_up_to_three(n, mean_sub)
-    s2_first, s2_total = s2_find_one(n, mean_mid_steps)
-
-    return (s1_first, s1_second, s1_third, s1_total,
-            s2_first, s2_total)
-
-
-# ----- Core2: S3 one decomp -----
-
-def s3_find_one(n: int, mean_sqrt_steps):
-    """
-    Strategy 3 on n, using mean_sqrt_steps.
-
-    Returns:
-      (step_first, total_steps)
-    """
-    state = Strat3State(mean_sqrt_steps, mpz(n))
-    total_steps = 0
-    first = None
-    n_mpz = mpz(n)
-
-    while True:
-        p = state.next_candidate()
-        if p is None:
-            break
-        if not is_prime(p):
+        p = ensure_prime_index(idx)
+        if p >= n:
             continue
-        q = n_mpz - p
-        total_steps += 1
+
+        q = n - p
+        total_checks += 1
         if is_prime(q):
-            first = total_steps
-            break
+            decomp_count += 1
+            if first_step is None:
+                first_step = total_checks
 
-    return first, total_steps
+    found = (decomp_count > 0)
+    if not found:
+        return False, 0, total_checks, 0
+    return True, first_step, total_checks, decomp_count
 
-
-def worker_core2(args):
-    """
-    Worker for core 2 (process 2): S3 only.
-
-    Input: (n, mean_sqrt_steps)
-    Output:
-      (s3_first, s3_total)
-    """
-    n, mean_sqrt_steps = args
-    init_primes()  # harmless if already inited
-    s3_first, s3_total = s3_find_one(n, mean_sqrt_steps)
-    return (s3_first, s3_total)
-
-
-# ----- Random even generator -----
 
 def random_even_with_digits(rng: random.Random, digits: int) -> int:
-    """Draw a random even integer with exactly `digits` decimal digits."""
     if digits <= 0:
         raise ValueError("Digit length must be positive.")
 
@@ -458,165 +109,80 @@ def random_even_with_digits(rng: random.Random, digits: int) -> int:
     return n
 
 
-# ----- Main sweep with 2-core parallelism -----
-
 def run_sweep(start_digits: int, end_digits: int, count_per_digit: int, seed: int | None) -> None:
     if start_digits > end_digits:
         start_digits, end_digits = end_digits, start_digits
 
     rng = random.Random(seed)
 
-    # Moving windows of per-digit mean total steps for each strategy
-    last_means_s1: list[float] = []
-    last_means_s2: list[float] = []
-    last_means_s3: list[float] = []
+    for D in range(start_digits, end_digits + 1):
+        # mean_sub is per digit length, reset for each D
+        mean_sub: float | None = None
+        sub_sum = 0
+        sub_count = 0
 
-    with ProcessPoolExecutor(max_workers=2) as pool:
-        for D in range(start_digits, end_digits + 1):
-            # Seed means from moving windows
-            mean_sub = (sum(last_means_s1) / len(last_means_s1)) if last_means_s1 else None
-            mean_mid = (sum(last_means_s2) / len(last_means_s2)) if last_means_s2 else None
-            mean_sqrt = (sum(last_means_s3) / len(last_means_s3)) if last_means_s3 else None
+        digit_sub_sum = 0
+        digit_sub_count = 0
+        digit_max_sub = 0
+        digit_skip = 0
 
-            # Per-digit accumulators for adaptation (total steps per n)
-            s1_total_sum = 0
-            s1_total_count = 0
+        # new: decomp stats per digit (first-phase only)
+        digit_decomp_sum = 0
+        digit_decomp_count = 0
+        digit_max_decomp = 0
 
-            s2_total_sum = 0
-            s2_total_count = 0
+        start_time = time.perf_counter()
 
-            s3_total_sum = 0
-            s3_total_count = 0
+        for _ in range(count_per_digit):
+            try:
+                n = random_even_with_digits(rng, D)
+            except ValueError:
+                digit_skip = count_per_digit
+                break
 
-            # Per-digit stats for step indices
-            s1_first_sum = 0
-            s1_first_count = 0
-            s1_second_sum = 0
-            s1_second_count = 0
-            s1_third_hits = 0  # count of n where S1 found a 3rd decomposition
+            found, first_step, total_checks, decomp_count = goldbach_s1_first_phase(n, mean_sub)
+            if found:
+                # first_step is the "subtractor count" we adapt on
+                digit_sub_sum += first_step
+                digit_sub_count += 1
+                if first_step > digit_max_sub:
+                    digit_max_sub = first_step
 
-            s2_first_sum = 0
-            s2_first_count = 0
+                # per-digit mean_sub adapts from the first-step (not total_checks)
+                sub_sum += first_step
+                sub_count += 1
+                mean_sub = sub_sum / sub_count
 
-            s3_first_sum = 0
-            s3_first_count = 0
+                # record decomposition counts in the first phase
+                digit_decomp_sum += decomp_count
+                digit_decomp_count += 1
+                if decomp_count > digit_max_decomp:
+                    digit_max_decomp = decomp_count
+            else:
+                digit_skip += 1
 
-            # n where S1 found no decompositions at all (Goldbach failure in this sampler)
-            skip = 0
+        end_time = time.perf_counter()
+        elapsed_ms = (end_time - start_time) * 1000.0
+        ms_per_n = elapsed_ms / count_per_digit if count_per_digit > 0 else 0.0
 
-            start_time = time.perf_counter()
+        avg_sub = math.ceil(digit_sub_sum / digit_sub_count) if digit_sub_count > 0 else 0
+        avg_decomp = (digit_decomp_sum / digit_decomp_count) if digit_decomp_count > 0 else 0.0
 
-            for _ in range(count_per_digit):
-                try:
-                    n = random_even_with_digits(rng, D)
-                except ValueError:
-                    skip = count_per_digit
-                    break
+        print(
+            f"D: {D} | Ms: {elapsed_ms:.3f} | Ms per n: {ms_per_n:.6f} | "
+            f"Max Sub: {digit_max_sub} | Avg. Sub: {avg_sub} | "
+            f"Avg Dec: {avg_decomp:.3f} | Max Dec: {digit_max_decomp} | "
+            f"Skip: {digit_skip}"
+        )
 
-                args1 = (n, mean_sub, mean_mid)
-                args2 = (n, mean_sqrt)
-
-                fut1 = pool.submit(worker_core1, args1)
-                fut2 = pool.submit(worker_core2, args2)
-
-                (s1_first, s1_second, s1_third, s1_total,
-                 s2_first, s2_total) = fut1.result()
-                s3_first, s3_total = fut2.result()
-
-                # If S1 never found a decomposition, count this n as skipped
-                if s1_first is None:
-                    skip += 1
-                else:
-                    # S1 adaptation & stats
-                    s1_total_sum += s1_total
-                    s1_total_count += 1
-                    mean_sub = s1_total_sum / s1_total_count
-
-                    s1_first_sum += s1_first
-                    s1_first_count += 1
-                    if s1_second is not None:
-                        s1_second_sum += s1_second
-                        s1_second_count += 1
-                    if s1_third is not None:
-                        s1_third_hits += 1
-
-                # S2 adaptation & stats (only if S2 found a decomp)
-                if s2_first is not None:
-                    s2_total_sum += s2_total
-                    s2_total_count += 1
-                    mean_mid = s2_total_sum / s2_total_count
-
-                    s2_first_sum += s2_first
-                    s2_first_count += 1
-
-                # S3 adaptation & stats (only if S3 found a decomp)
-                if s3_first is not None:
-                    s3_total_sum += s3_total
-                    s3_total_count += 1
-                    mean_sqrt = s3_total_sum / s3_total_count
-
-                    s3_first_sum += s3_first
-                    s3_first_count += 1
-
-            end_time = time.perf_counter()
-            elapsed_ms = (end_time - start_time) * 1000.0
-            ms_per_n = elapsed_ms / count_per_digit if count_per_digit > 0 else 0.0
-
-            # Update moving windows with per-digit mean total steps
-            if s1_total_count > 0:
-                digit_mean_s1 = s1_total_sum / s1_total_count
-                last_means_s1.append(digit_mean_s1)
-                if len(last_means_s1) > WINDOW_SIZE:
-                    last_means_s1.pop(0)
-
-            if s2_total_count > 0:
-                digit_mean_s2 = s2_total_sum / s2_total_count
-                last_means_s2.append(digit_mean_s2)
-                if len(last_means_s2) > WINDOW_SIZE:
-                    last_means_s2.pop(0)
-
-            if s3_total_count > 0:
-                digit_mean_s3 = s3_total_sum / s3_total_count
-                last_means_s3.append(digit_mean_s3)
-                if len(last_means_s3) > WINDOW_SIZE:
-                    last_means_s3.pop(0)
-
-            def avg_or_zero(s, c):
-                return (s / c) if c > 0 else 0.0
-
-            s1_first_mean = avg_or_zero(s1_first_sum, s1_first_count)
-            s1_second_mean = avg_or_zero(s1_second_sum, s1_second_count)
-            s2_first_mean = avg_or_zero(s2_first_sum, s2_first_count)
-            s3_first_mean = avg_or_zero(s3_first_sum, s3_first_count)
-
-            print(f"D: {D} | Ms: {elapsed_ms:.3f} | Ms per n: {ms_per_n:.6f} |")
-            print(
-                f"  S1 steps (1st/2nd): {s1_first_mean:.3f} ({s1_first_count}) / "
-                f"{s1_second_mean:.3f} ({s1_second_count})"
-            )
-            print(f"  S1 third hits: {s1_third_hits}")
-            print(
-                f"  S2 steps (1st): {s2_first_mean:.3f} ({s2_first_count})"
-            )
-            print(
-                f"  S3 steps (1st): {s3_first_mean:.3f} ({s3_first_count})"
-            )
-            print(
-                f"  Skip (S1 found no decomp): {skip}"
-            )
-
-
-# ----- CLI -----
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Goldbach sampler with 3 strategies and 2-core parallelism."
-    )
+    p = argparse.ArgumentParser(description="Goldbach sampler (Strategy 1, first phase only, multi-decomp).")
     p.add_argument(
         "--sweep",
         type=str,
         required=True,
-        help="Digit range A:B (e.g. 20:50).",
+        help="Digit range A:B (e.g. 4:10).",
     )
     p.add_argument(
         "--count",
@@ -640,12 +206,8 @@ def main() -> None:
         start_digits = int(start_str)
         end_digits = int(end_str)
     except Exception as e:
-        raise SystemExit(
-            f"Invalid --sweep format. Expected A:B, got '{args.sweep}'."
-        ) from e
+        raise SystemExit(f"Invalid --sweep format. Expected A:B, got '{args.sweep}'.") from e
 
-    # Precompute primes in parent so children can inherit
-    init_primes()
     run_sweep(start_digits, end_digits, args.count, args.seed)
 
 
