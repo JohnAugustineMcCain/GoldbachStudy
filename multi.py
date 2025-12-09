@@ -3,25 +3,35 @@
 Goldbach sampler with 3 strategies and 2-core parallelism.
 
 Core 1 (worker_core1): Strategy 1 + Strategy 2
-  - S1: search over small subtractor primes (precomputed list of 100000 primes).
-        Find up to 3 decompositions for each n.
-        Record steps for 1st and 2nd decompositions.
-        If a 3rd decomposition is found in S1, stop S1 and DO NOT run S2 for that n.
-  - S2: only runs if S1 did not reach 3 decompositions.
-        Search around n/2, find 1 decomposition, record step.
+  - S1: small subtractor primes (precomputed table of 100000 primes).
+        For each n:
+          * search subtractor primes p
+          * count q-tests (is_prime(n - p))
+          * record step of 1st and 2nd decompositions
+          * stop after a 3rd decomposition (just record that it happened)
+  - S2: around n/2 (only runs, conceptually, for stats; S1 is independent).
+        For each n:
+          * search odd p >= n/2
+          * require p and q = n - p both prime
+          * record step of 1st decomposition if any
 
 Core 2 (worker_core2): Strategy 3
-  - S3: search around sqrt(n), find 1 decomposition, record step.
+  - S3: around sqrt(n).
+        For each n:
+          * search odd p near floor(sqrt(n))
+          * require p and q = n - p both prime
+          * record step of 1st decomposition if any
 
 Heuristic adaptation:
-  - For S1, S2, S3 we track per-digit mean total steps.
-  - For a given digit D, the initial mean parameter for each strategy is seeded
-    from a moving window of the last 20 digits' per-digit means (for that strategy).
-  - Within digit D, the mean for each strategy is refined from this digit’s results.
+  - For S1, S2, S3 we track per-digit mean *total steps* (q-tests) per strategy.
+  - For digit D, each strategy’s initial mean is seeded from a moving window
+    of the last 20 digits’ per-digit means for that strategy.
+  - Within digit D, a strategy’s mean is updated only on ns where it finds a
+    first decomposition.
 
-We only include n in the per-digit stats if all three strategies found a first
-decomposition (S1_first, S2_first, S3_first all non-None).
-`Skip` counts how many n failed that condition.
+We only treat an n as “skipped” if *S1* fails to find a first decomposition
+(i.e., no Goldbach decomposition found by subtractor primes within our prime table).
+S2/S3 failures are allowed and simply not used in their averages.
 
 CLI:
   --sweep A:B   digit range inclusive (e.g. 20:50)
@@ -293,7 +303,7 @@ class Strat3State:
                 return p
 
 
-# ----- Core1: S1 and S2 (with S1 3-decomp limit) -----
+# ----- Core1: S1 up to 3 decomps, S2 one decomp -----
 
 def s1_find_up_to_three(n: int, mean_sub):
     """
@@ -376,19 +386,13 @@ def worker_core1(args):
     init_primes()
 
     s1_first, s1_second, s1_third, s1_total = s1_find_up_to_three(n, mean_sub)
-
-    # If S1 found 3 decompositions, we do NOT run S2.
-    if s1_third is not None:
-        s2_first = None
-        s2_total = 0
-    else:
-        s2_first, s2_total = s2_find_one(n, mean_mid_steps)
+    s2_first, s2_total = s2_find_one(n, mean_mid_steps)
 
     return (s1_first, s1_second, s1_third, s1_total,
             s2_first, s2_total)
 
 
-# ----- Core2: S3 only -----
+# ----- Core2: S3 one decomp -----
 
 def s3_find_one(n: int, mean_sqrt_steps):
     """
@@ -426,7 +430,7 @@ def worker_core2(args):
       (s3_first, s3_total)
     """
     n, mean_sqrt_steps = args
-    init_primes()  # not strictly needed for S3, but harmless
+    init_primes()  # harmless if already inited
     s3_first, s3_total = s3_find_one(n, mean_sqrt_steps)
     return (s3_first, s3_total)
 
@@ -497,7 +501,8 @@ def run_sweep(start_digits: int, end_digits: int, count_per_digit: int, seed: in
             s3_first_sum = 0
             s3_first_count = 0
 
-            skip = 0  # n where any of S1/S2/S3 failed to produce a first decomposition
+            # n where S1 found no decompositions at all (Goldbach failure in this sampler)
+            skip = 0
 
             start_time = time.perf_counter()
 
@@ -518,40 +523,40 @@ def run_sweep(start_digits: int, end_digits: int, count_per_digit: int, seed: in
                  s2_first, s2_total) = fut1.result()
                 s3_first, s3_total = fut2.result()
 
-                # We require all three strategies to have at least one decomposition
-                # for this n to be included in stats.
-                if s1_first is None or s2_first is None or s3_first is None:
+                # If S1 never found a decomposition, count this n as skipped
+                if s1_first is None:
                     skip += 1
-                    continue
+                else:
+                    # S1 adaptation & stats
+                    s1_total_sum += s1_total
+                    s1_total_count += 1
+                    mean_sub = s1_total_sum / s1_total_count
 
-                # S1 adaptation and stats
-                s1_total_sum += s1_total
-                s1_total_count += 1
-                mean_sub = s1_total_sum / s1_total_count
+                    s1_first_sum += s1_first
+                    s1_first_count += 1
+                    if s1_second is not None:
+                        s1_second_sum += s1_second
+                        s1_second_count += 1
+                    if s1_third is not None:
+                        s1_third_hits += 1
 
-                s1_first_sum += s1_first
-                s1_first_count += 1
-                if s1_second is not None:
-                    s1_second_sum += s1_second
-                    s1_second_count += 1
-                if s1_third is not None:
-                    s1_third_hits += 1
+                # S2 adaptation & stats (only if S2 found a decomp)
+                if s2_first is not None:
+                    s2_total_sum += s2_total
+                    s2_total_count += 1
+                    mean_mid = s2_total_sum / s2_total_count
 
-                # S2 adaptation and stats
-                s2_total_sum += s2_total
-                s2_total_count += 1
-                mean_mid = s2_total_sum / s2_total_count
+                    s2_first_sum += s2_first
+                    s2_first_count += 1
 
-                s2_first_sum += s2_first
-                s2_first_count += 1
+                # S3 adaptation & stats (only if S3 found a decomp)
+                if s3_first is not None:
+                    s3_total_sum += s3_total
+                    s3_total_count += 1
+                    mean_sqrt = s3_total_sum / s3_total_count
 
-                # S3 adaptation and stats
-                s3_total_sum += s3_total
-                s3_total_count += 1
-                mean_sqrt = s3_total_sum / s3_total_count
-
-                s3_first_sum += s3_first
-                s3_first_count += 1
+                    s3_first_sum += s3_first
+                    s3_first_count += 1
 
             end_time = time.perf_counter()
             elapsed_ms = (end_time - start_time) * 1000.0
@@ -597,7 +602,7 @@ def run_sweep(start_digits: int, end_digits: int, count_per_digit: int, seed: in
                 f"  S3 steps (1st): {s3_first_mean:.3f} ({s3_first_count})"
             )
             print(
-                f"  Skip (any strat missing first decomp): {skip}"
+                f"  Skip (S1 found no decomp): {skip}"
             )
 
 
@@ -639,7 +644,7 @@ def main() -> None:
             f"Invalid --sweep format. Expected A:B, got '{args.sweep}'."
         ) from e
 
-    # Important: precompute primes in the parent so child processes inherit the table
+    # Precompute primes in parent so children can inherit
     init_primes()
     run_sweep(start_digits, end_digits, args.count, args.seed)
 
